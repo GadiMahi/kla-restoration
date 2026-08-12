@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+artifacts/cache/
+artifacts/*.json
+!artifacts/.gitkeep
+weights/*.pt
+weights/*.pth
+results/*.png
+results/*.csv
+data/
+*.egg-info/
+.venv/
+artifacts/*.csv
+artifacts/inventory.csv

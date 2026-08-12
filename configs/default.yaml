@@ -1,0 +1,62 @@
+# Single source of truth for paths and hyperparameters.
+# Evaluators must never need to edit source code (KLA spec, section 4C).
+# Override any value from the CLI:  --set data.root=/kaggle/input/kla-data
+
+data:
+  # Kaggle:  /kaggle/input/<dataset-slug>
+  # Local:   ./data
+  root: /kaggle/input/kla-dataset
+  gt_subdir: GT
+  lr_subdir: NoisyLR
+  # Leave null to auto-detect from the files themselves.
+  file_glob: null
+
+io:
+  # All auto-detected by scripts/run_inventory.py, then frozen here.
+  # Output MUST match GT format exactly - KLA scores images as saved.
+  output_format: null      # 'npy' | 'tiff32' | 'png16' | 'png8'
+  output_dtype: null
+  output_suffix: null
+
+cache:
+  dir: /kaggle/working/cache
+  gt_dtype: float32        # float32 | uint16  (never float16)
+  lr_dtype: float32        # LR exceeds [0,1]; keep float32
+
+dataset:
+  lr_patch: 64             # HR patch = lr_patch * scale
+  scale: 2
+  grad_percentile: 40      # rejection-sampling threshold
+  crop_tries: 8
+
+degrade:
+  width: 1.0               # curriculum knob, ramp 0.3 -> 1.0
+  # Filled in by notebooks/02_degradation.ipynb
+  kernels: [bicubic_aa, bilinear_aa, area, lanczos]
+  kernel_p: [0.55, 0.15, 0.15, 0.15]
+  order_mix: [0.5, 0.5]    # [noise_first, noise_last]
+  meas_mult: 0.10
+  meas_add: 0.02
+  jitter: 0.30             # +/- fraction. KLA: levels vary "within a similar range"
+
+augment:
+  scale_jitter: [0.7, 1.4]
+  d4: true
+  cutblur_p: 0.7
+
+split:
+  n_clusters: 6
+  ood_cluster: 5
+  val_frac: 0.1
+  seed: 1337
+
+train:
+  seed: 1337
+  batch_size: 32
+  num_workers: 8
+
+inference:
+  batch_size: 8
+  device: cuda
+  amp: true
+  pad_multiple: 16         # set by the model team (NAFNet stride)
