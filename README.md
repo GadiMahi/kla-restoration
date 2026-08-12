@@ -19,6 +19,7 @@ interfaces described below without changing anything here.
 DATA = "/kaggle/input/<dataset-slug>"
 
 # 1. FORMAT CONTRACT + INVENTORY  <- run this first, always
+#    Interactive version with plots: notebooks/01_inventory.ipynb
 !python scripts/run_inventory.py --set data.root=$DATA
 
 # 2. Cache + dataloader throughput
@@ -115,6 +116,28 @@ regardless and tell us very little.
 
 ---
 
+## Notebooks vs scripts
+
+Both exist on purpose.
+
+* **`notebooks/`** — the exploratory blocks, where you need to *see* things:
+  histograms, sample images, the variance-vs-signal scatter, kernel rankings.
+  Written for Kaggle; they `sys.path` into `src/` and use `%autoreload`.
+* **`scripts/` + `src/`** — the reproducible pipeline. The submission requires a
+  repo that evaluators can run without editing source, and "training & compute
+  hygiene" is a scored evaluation axis, so the pipeline cannot live in notebook
+  cells.
+
+The notebooks call into `src/`, so there is one implementation, not two.
+
+| Notebook | Covers | Writes |
+|---|---|---|
+| `01_inventory.ipynb` | format contract, shapes, ranges, overshoot, normalisation decision, visual check | `artifacts/stats.json` |
+| `02_degradation.ipynb` | kernel recovery, sub-pixel alignment, noise model fit, degradation order, log-transform decision, recipe verification | updates `artifacts/stats.json` |
+
+`scripts/run_inventory.py` is the headless equivalent of notebook 01, for CI and
+for re-running after the data changes.
+
 ## Layout
 
 ```
@@ -129,6 +152,7 @@ src/augment.py           scale jitter, D4, CutBlur
 src/splits.py            structure clustering + OOD proxy split
 src/eval_utils.py        PSNR / SSIM / LPIPS + edge-stratified SSIM
 src/model.py             model registry (bicubic placeholder today)
+notebooks/               interactive EDA, imports from src/
 inference.py             standalone --input_dir/--output_dir harness, timed
 scripts/                 runnable entry points
 tests/                   normalisation round-trip
@@ -141,6 +165,13 @@ Verified without the real dataset, using `scripts/make_dummy_data.py`:
 * format round-trip passes for `npy`, `tiff32`, `png16`, `png8`
 * inventory, shape/range/overshoot reporting, normalisation decision
 * structure clustering and OOD split
+* kernel recovery correctly identified the planted kernel
+* noise-model fit recovered sigma_mult within ~20% of the planted value
+
+One method was corrected as a result: the lag-1 autocorrelation test for
+degradation order **fails at 2x** (reported 0% when the truth was 40%). Notebook
+02 now uses forward-simulation hypothesis testing as the primary method and keeps
+autocorrelation only as a secondary signal.
 
 Not yet exercised (no GPU/torch in the authoring environment) — **verify these
 on Kaggle in the first session:** `make_cache.py`, `dataset.py`,
