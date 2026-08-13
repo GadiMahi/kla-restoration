@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""
-Training entry point - OWNED BY THE MODEL TEAM.
-Trains the NAFNet architecture using a composite Charbonnier + SSIM + LPIPS loss.
-Evaluates and saves checkpoints strictly based on the val_ood split.
-
-Run via:
-    python train.py --set data.root=/kaggle/input/kla-dataset output.dir=/kaggle/working/kla-restoration/artifacts
-"""
 from __future__ import annotations
-
 import argparse
 import sys
 import os
@@ -18,45 +9,56 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from torchinfo import summary
 
-import numpy as np
 from src.config import add_config_args, load_config
 from src.dataset import RestorationDataset
 from src.splits import load_splits
 from src.model import MODELS
-from src.eval_utils import edge_weight, stratified_ssim
-
-# Third-party library for perceptual loss. 
-# (Run: pip install lpips)
+from src.eval_utils import stratified_ssim
 import lpips 
 
+# --- PyTorch Native Losses ---
 
 class CharbonnierLoss(nn.Module):
-    """Robust L1 loss that handles outliers like extreme speckle noise."""
     def __init__(self, eps=1e-3):
         super().__init__()
         self.eps = eps
+    def forward(self, pred, target):
+        return torch.mean(torch.sqrt((pred - target)**2 + self.eps**2))
 
-    def forward(self, pred, target, weight_map=None):
-        loss = torch.sqrt((pred - target)**2 + self.eps**2)
-        if weight_map is not None:
-            loss = loss * weight_map
-        return torch.mean(loss)
+class SobelEdgeLoss(nn.Module):
+    """
+    Computes spatial gradients (edges) directly in PyTorch.
+    Forces the network to output sharp edges instead of blurring them.
+    """
+    def __init__(self):
+        super().__init__()
+        kernel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).view(1, 1, 3, 3)
+        kernel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]).view(1, 1, 3, 3)
+        self.register_buffer('weight_x', kernel_x)
+        self.register_buffer('weight_y', kernel_y)
+        self.l1 = nn.L1Loss()
 
+    def forward(self, pred, target):
+        pred_x = F.conv2d(pred, self.weight_x, padding=1)
+        pred_y = F.conv2d(pred, self.weight_y, padding=1)
+        target_x = F.conv2d(target, self.weight_x, padding=1)
+        target_y = F.conv2d(target, self.weight_y, padding=1)
+        return self.l1(pred_x, target_x) + self.l1(pred_y, target_y)
+
+# --- Core Loop ---
 
 def train_one_epoch(model, dataloader, optimizer, loss_fns, device):
     model.train()
     total_loss = 0.0
-    
-    charbonnier, lpips_fn = loss_fns
+    charbonnier, lpips_fn, sobel_loss = loss_fns
     
     pbar = tqdm(dataloader, desc="Training", leave=False)
     for batch in pbar:
-        # 1. Handle dictionary unpacking safely
         if isinstance(batch, dict):
             noisy_lr = batch.get("lr", batch.get("noisy")).to(device)
             clean_hr = batch.get("hr", batch.get("gt")).to(device)
@@ -64,35 +66,24 @@ def train_one_epoch(model, dataloader, optimizer, loss_fns, device):
             noisy_lr, clean_hr = batch[0].to(device), batch[1].to(device)
         
         optimizer.zero_grad()
-        
-        # Forward pass
         pred_hr = model(noisy_lr)
         
-        # 2. Edge-weighted Charbonnier Loss
-        clean_hr_np = clean_hr.detach().cpu().numpy()
+        # 1. Base Pixel Loss
+        l_char = charbonnier(pred_hr, clean_hr)
         
-        # FIX: The data team's edge_weight expects a 2D image (H, W). 
-        # We loop through the batch to apply it correctly per image.
-        import numpy as np # Fallback import just in case
-        edges_np = np.zeros_like(clean_hr_np)
-        for i in range(clean_hr_np.shape[0]):
-            edges_np[i, 0] = edge_weight(clean_hr_np[i, 0])
-            
-        edges = torch.from_numpy(edges_np).to(device)
-        
-        l_char = charbonnier(pred_hr, clean_hr, weight_map=edges)
-        
-        # 3. Perceptual Loss (LPIPS)
+        # 2. Perceptual Loss (Scaled to [-1, 1])
         pred_norm = pred_hr * 2.0 - 1.0
         clean_norm = clean_hr * 2.0 - 1.0
         l_perceptual = lpips_fn(pred_norm, clean_norm).mean()
         
-        loss = (1.0 * l_char) + (0.1 * l_perceptual)
+        # 3. Structural Edge Loss (Differentiable)
+        l_edge = sobel_loss(pred_hr, clean_hr)
         
-        # Backward pass
+        # The Re-balanced Composite Loss
+        loss = (1.0 * l_char) + (1.5 * l_perceptual) + (0.5 * l_edge)
+        
         loss.backward()
         optimizer.step()
-        
         total_loss += loss.item()
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
         
@@ -101,7 +92,6 @@ def train_one_epoch(model, dataloader, optimizer, loss_fns, device):
 
 @torch.no_grad()
 def evaluate_ood(model, dataloader, device):
-    """Evaluates strictly on the out-of-distribution validation split."""
     model.eval()
     total_ssim = 0.0
     total_ssim_edge = 0.0
@@ -117,16 +107,12 @@ def evaluate_ood(model, dataloader, device):
         pred_hr = model(noisy_lr)
         pred_hr = torch.clamp(pred_hr, 0.0, 1.0)
         
-        # FIX: Squeeze out the Batch and Channel dimensions (1, 1, H, W) -> (H, W)
-        # so skimage structural_similarity works correctly.
+        # Convert to numpy strictly for the evaluation metrics
         pred_np = pred_hr.cpu().numpy()[0, 0]
         clean_np = clean_hr.cpu().numpy()[0, 0]
         
-        ssim_val, ssim_edge, _ = stratified_ssim(pred_np, clean_np)
-        
         metrics = stratified_ssim(pred_np, clean_np)
         
-        # Safely extract the values (handling both dict and tuple returns just in case)
         if isinstance(metrics, dict):
             total_ssim += float(metrics["ssim"])
             total_ssim_edge += float(metrics["ssim_edge"])
@@ -136,7 +122,6 @@ def evaluate_ood(model, dataloader, device):
         
     avg_ssim = total_ssim / len(dataloader)
     avg_ssim_edge = total_ssim_edge / len(dataloader)
-    
     return avg_ssim, avg_ssim_edge
 
 
@@ -146,40 +131,28 @@ def main() -> int:
     cfg = load_config(args.config, args.overrides)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"--- Booting Training Pipeline on {device} ---")
-
-    # Helper function to safely traverse nested configurations
+    
     def get_cfg(key, default=None):
         if hasattr(cfg, "get_path"):
             try:
                 val = cfg.get_path(key)
-                if val is not None:
-                    return val
-            except Exception:
-                pass
+                if val is not None: return val
+            except Exception: pass
         if hasattr(cfg, "get"):
             val = cfg.get(key)
-            if val is not None:
-                return val
+            if val is not None: return val
         return default
 
-    # 1. Setup Output Directory
     output_dir = Path(get_cfg("output.dir", "/kaggle/working/kla-restoration/artifacts"))
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Saving artifacts to: {output_dir}")
-
-    # 2. Load Data Splits & Initialize Datasets
+    
     torch.manual_seed(get_cfg("train.seed", 42))
     sp = load_splits()
-    
     cache_dir = get_cfg("cache.dir", "/kaggle/working/cache")
-    print(f"Reading cache from: {cache_dir}")
     
     train_ds = RestorationDataset(cache_dir, stems=sp["train"])
-    # Primary Metric: Held-out structure cluster
     val_ood_ds = RestorationDataset(cache_dir, stems=sp["val_ood"], train=False)
     
-    # 3. Create Dataloaders (Optimized for H100 I/O)
     batch_size = get_cfg("train.batch_size", 8)
     workers = get_cfg("train.num_workers", 4)
     
@@ -192,54 +165,40 @@ def main() -> int:
         num_workers=workers, pin_memory=True
     )
 
-    # 4. Initialize Architecture
     scale_factor = get_cfg("dataset.scale", 2)
     model = MODELS["nafnet"](scale=scale_factor).to(device)
-
-    print("\n--- Model Architecture Summary ---")
-    # Assuming input shape is (Batch, Channels, Height, Width) -> e.g., (8, 1, 128, 128)
-    summary(model, input_size=(batch_size, 1, 128, 128), device=device)
-    print("----------------------------------\n")
-    # 5. Optimization & Loss setup
-    learning_rate = get_cfg("train.lr", 1e-4)
-    epochs = get_cfg("train.epochs", 20)
     
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    epochs = get_cfg("train.epochs", 100)
+    optimizer = optim.AdamW(model.parameters(), lr=get_cfg("train.lr", 2e-4), weight_decay=1e-4)
+    
+    # Cosine annealing ensures the model settles into fine details in later epochs
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
     charbonnier = CharbonnierLoss().to(device)
+    sobel_loss = SobelEdgeLoss().to(device)
     lpips_fn = lpips.LPIPS(net='vgg').to(device)
-    # Freeze LPIPS network weights
     for param in lpips_fn.parameters():
         param.requires_grad = False
         
-    loss_fns = (charbonnier, lpips_fn)
-
-    # 6. Main Training Loop
+    loss_fns = (charbonnier, lpips_fn, sobel_loss)
     best_ood_ssim = 0.0
     
-    print(f"Starting training for {epochs} epochs...")
+    print(f"--- Starting Training Run (U-Net NAFNet) for {epochs} epochs on {device} ---")
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, loss_fns, device)
         scheduler.step()
         
         ood_ssim, ood_ssim_edge = evaluate_ood(model, val_loader, device)
         
-        print(f"Epoch {epoch:03d}/{epochs:03d} | "
-              f"Train Loss: {train_loss:.4f} | "
-              f"OOD SSIM: {ood_ssim:.4f} | "
-              f"OOD Edge SSIM: {ood_ssim_edge:.4f}")
+        print(f"Epoch {epoch:03d}/{epochs:03d} | Loss: {train_loss:.4f} | "
+              f"OOD SSIM: {ood_ssim:.4f} | OOD Edge: {ood_ssim_edge:.4f}")
         
-        # 7. Checkpointing: Save only if it beats the previous OOD score
         if ood_ssim > best_ood_ssim:
             best_ood_ssim = ood_ssim
             save_path = output_dir / "best_nafnet.pt"
-            
-            # Save the raw state dictionary for easy loading in inference.py
             torch.save(model.state_dict(), save_path)
-            print(f" -> New Best OOD SSIM! Checkpoint saved to {save_path}")
+            print(f" -> Checkpoint saved to {save_path}")
 
-    print("Training Complete. Final Best OOD SSIM:", best_ood_ssim)
     return 0
 
 if __name__ == "__main__":
