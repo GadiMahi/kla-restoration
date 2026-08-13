@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from torchinfo import summary
 
 from src.config import add_config_args, load_config
 from src.dataset import RestorationDataset
@@ -55,7 +56,22 @@ def train_one_epoch(model, dataloader, optimizer, loss_fns, device):
     pbar = tqdm(dataloader, desc="Training", leave=False)
     for batch in pbar:
         # Assuming the dataloader yields (noisy_lr, clean_hr)
-        noisy_lr, clean_hr = batch[0].to(device), batch[1].to(device)
+
+        if isinstance(batch, dict):
+            # Print keys once so you know exactly what they are if it fails
+            if "lr" not in batch and "noisy" not in batch:
+                print(f"DEBUG - Batch keys are: {batch.keys()}")
+                
+            # Grab the noisy input (handling common naming conventions)
+            noisy_key = "lr" if "lr" in batch else "noisy"
+            noisy_lr = batch[noisy_key].to(device)
+            
+            # Grab the ground truth target
+            hr_key = "hr" if "hr" in batch else "gt"
+            clean_hr = batch[hr_key].to(device)
+        else:
+            # Fallback in case it's a tuple
+            noisy_lr, clean_hr = batch[0].to(device), batch[1].to(device)
         
         optimizer.zero_grad()
         
@@ -101,7 +117,22 @@ def evaluate_ood(model, dataloader, device):
     
     pbar = tqdm(dataloader, desc="Validating (OOD)", leave=False)
     for batch in pbar:
-        noisy_lr, clean_hr = batch[0].to(device), batch[1].to(device)
+        # Check if batch is a dictionary (Mahi's dataset format)
+        if isinstance(batch, dict):
+            # Print keys once so you know exactly what they are if it fails
+            if "lr" not in batch and "noisy" not in batch:
+                print(f"DEBUG - Batch keys are: {batch.keys()}")
+                
+            # Grab the noisy input (handling common naming conventions)
+            noisy_key = "lr" if "lr" in batch else "noisy"
+            noisy_lr = batch[noisy_key].to(device)
+            
+            # Grab the ground truth target
+            hr_key = "hr" if "hr" in batch else "gt"
+            clean_hr = batch[hr_key].to(device)
+        else:
+            # Fallback in case it's a tuple
+            noisy_lr, clean_hr = batch[0].to(device), batch[1].to(device)
         pred_hr = model(noisy_lr)
         
         # The data pipeline ensures outputs are clamped to [0,1]
@@ -172,7 +203,11 @@ def main() -> int:
     # 4. Initialize Architecture
     scale_factor = get_cfg("dataset.scale", 2)
     model = MODELS["nafnet"](scale=scale_factor).to(device)
-    
+
+    print("\n--- Model Architecture Summary ---")
+    # Assuming input shape is (Batch, Channels, Height, Width) -> e.g., (8, 1, 128, 128)
+    summary(model, input_size=(batch_size, 1, 128, 128), device=device)
+    print("----------------------------------\n")
     # 5. Optimization & Loss setup
     learning_rate = get_cfg("train.lr", 1e-4)
     epochs = get_cfg("train.epochs", 20)
