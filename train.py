@@ -5,7 +5,7 @@ Trains the NAFNet architecture using a composite Charbonnier + SSIM + LPIPS loss
 Evaluates and saves checkpoints strictly based on the val_ood split.
 
 Run via:
-    python train.py --set data.root=/kaggle/input/kla-dataset output_dir=/kaggle/working/artifacts
+    python train.py --set data.root=/kaggle/input/kla-dataset output.dir=/kaggle/working/kla-restoration/artifacts
 """
 from __future__ import annotations
 
@@ -125,23 +125,40 @@ def main() -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"--- Booting Training Pipeline on {device} ---")
 
+    # Helper function to safely traverse nested configurations
+    def get_cfg(key, default=None):
+        if hasattr(cfg, "get_path"):
+            try:
+                val = cfg.get_path(key)
+                if val is not None:
+                    return val
+            except Exception:
+                pass
+        if hasattr(cfg, "get"):
+            val = cfg.get(key)
+            if val is not None:
+                return val
+        return default
+
     # 1. Setup Output Directory
-    output_dir = Path(cfg.get("output_dir", "/kaggle/working/artifacts"))
+    output_dir = Path(get_cfg("output.dir", "/kaggle/working/kla-restoration/artifacts"))
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Saving artifacts to: {output_dir}")
 
     # 2. Load Data Splits & Initialize Datasets
-    torch.manual_seed(cfg.get("train.seed", 42))
+    torch.manual_seed(get_cfg("train.seed", 42))
     sp = load_splits()
     
-    cache_dir = cfg.get("cache.dir")
+    cache_dir = get_cfg("cache.dir", "/kaggle/working/cache")
+    print(f"Reading cache from: {cache_dir}")
     
     train_ds = RestorationDataset(cache_dir, stems=sp["train"])
     # Primary Metric: Held-out structure cluster
     val_ood_ds = RestorationDataset(cache_dir, stems=sp["val_ood"], train=False)
     
     # 3. Create Dataloaders (Optimized for H100 I/O)
-    batch_size = cfg.get("train.batch_size", 16)
-    workers = cfg.get("train.num_workers", 4)
+    batch_size = get_cfg("train.batch_size", 8)
+    workers = get_cfg("train.num_workers", 4)
     
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True, 
@@ -153,12 +170,15 @@ def main() -> int:
     )
 
     # 4. Initialize Architecture
-    scale_factor = cfg.get("dataset.scale", 2)
+    scale_factor = get_cfg("dataset.scale", 2)
     model = MODELS["nafnet"](scale=scale_factor).to(device)
     
     # 5. Optimization & Loss setup
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.get("train.lr", 1e-4), weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.get("train.epochs", 50))
+    learning_rate = get_cfg("train.lr", 1e-4)
+    epochs = get_cfg("train.epochs", 20)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     
     charbonnier = CharbonnierLoss().to(device)
     lpips_fn = lpips.LPIPS(net='vgg').to(device)
@@ -169,7 +189,6 @@ def main() -> int:
     loss_fns = (charbonnier, lpips_fn)
 
     # 6. Main Training Loop
-    epochs = cfg.get("train.epochs", 50)
     best_ood_ssim = 0.0
     
     print(f"Starting training for {epochs} epochs...")
