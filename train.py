@@ -124,8 +124,15 @@ def evaluate_ood(model, dataloader, device):
         
         ssim_val, ssim_edge, _ = stratified_ssim(pred_np, clean_np)
         
-        total_ssim += float(ssim_val)
-        total_ssim_edge += float(ssim_edge)
+        metrics = stratified_ssim(pred_np, clean_np)
+        
+        # Safely extract the values (handling both dict and tuple returns just in case)
+        if isinstance(metrics, dict):
+            total_ssim += float(metrics["ssim"])
+            total_ssim_edge += float(metrics["ssim_edge"])
+        else:
+            total_ssim += float(metrics[0])
+            total_ssim_edge += float(metrics[1])
         
     avg_ssim = total_ssim / len(dataloader)
     avg_ssim_edge = total_ssim_edge / len(dataloader)
