@@ -46,14 +46,16 @@ augment:
 
 split:
   n_clusters: 6
-  ood_cluster: 5
+  ood_cluster: null      # null => auto-pick the largest cluster under max_ood_frac
   val_frac: 0.1
+  max_ood_frac: 0.25     # OOD cluster must be big enough to be a reliable metric
+  min_ood_n: 150
   seed: 1337
 
 train:
   seed: 1337
   batch_size: 32
-  num_workers: 8
+  num_workers: 4        # Kaggle CPU allowance; 8 triggers a warning
 
 inference:
   batch_size: 8

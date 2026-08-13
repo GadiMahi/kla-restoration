@@ -33,18 +33,42 @@ def structure_features(images) -> np.ndarray:
     return np.asarray(rows, dtype=np.float32)
 
 
-def make_splits(stems, features, n_clusters=6, ood_cluster=5, val_frac=0.1, seed=1337) -> dict:
+def choose_ood_cluster(labels, max_frac=0.25, min_n=150) -> int:
+    """Pick a held-out cluster big enough to be a trustworthy metric.
+
+    A tiny cluster (say 35 of 3200 images) is an outlier bucket, not a
+    distribution: the variance on it swamps any real difference between models.
+    """
+    import collections
+
+    counts = collections.Counter(labels.tolist())
+    n = len(labels)
+    ok = [(c, k) for k, c in counts.items() if min_n <= c <= max_frac * n]
+    if ok:
+        return int(max(ok)[1])           # largest cluster that still fits the cap
+    return int(max(counts.items(), key=lambda kv: kv[1])[0])
+
+
+def make_splits(stems, features, n_clusters=6, ood_cluster=None, val_frac=0.1, seed=1337,
+                max_ood_frac=0.25, min_ood_n=150) -> dict:
     from sklearn.cluster import KMeans
     from sklearn.preprocessing import StandardScaler
 
     x = StandardScaler().fit_transform(features)
     labels = KMeans(n_clusters=n_clusters, n_init=10, random_state=seed).fit_predict(x)
 
+    if ood_cluster is None:
+        ood_cluster = choose_ood_cluster(labels, max_ood_frac, min_ood_n)
+
     rng = np.random.default_rng(seed)
     ood = [s for s, l in zip(stems, labels) if l == ood_cluster]
     rest = [s for s, l in zip(stems, labels) if l != ood_cluster]
     rng.shuffle(rest)
     n_val = max(1, int(len(rest) * val_frac))
+
+    if len(ood) < min_ood_n:
+        print(f"!! val_ood has only {len(ood)} images - too few for a stable metric. "
+              f"Cluster sizes: {dict(sorted(__import__('collections').Counter(labels.tolist()).items()))}")
 
     return {
         "train": sorted(rest[n_val:]),

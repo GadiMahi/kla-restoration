@@ -34,9 +34,12 @@ def main() -> int:
                      n_clusters=cfg.get_path("split.n_clusters"),
                      ood_cluster=cfg.get_path("split.ood_cluster"),
                      val_frac=cfg.get_path("split.val_frac"),
-                     seed=cfg.get_path("split.seed"))
+                     seed=cfg.get_path("split.seed"),
+                     max_ood_frac=cfg.get_path("split.max_ood_frac", 0.25),
+                     min_ood_n=cfg.get_path("split.min_ood_n", 150))
     save_splits(sp)
 
+    print("held-out OOD cluster:", sp["ood_cluster"])
     print("cluster sizes:", dict(sorted(Counter(sp["clusters"].values()).items())))
     print(f"train={len(sp['train'])}  val_id={len(sp['val_id'])}  val_ood={len(sp['val_ood'])}")
     print("\nEyeball a few images per cluster before trusting this split.")

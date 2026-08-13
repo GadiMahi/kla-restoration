@@ -101,8 +101,13 @@ def main() -> int:
     cv = float(df.gt_mean.std() / (df.gt_mean.mean() + 1e-9))
     print(f"\n=== NORMALISATION DECISION ===")
     print(f"CV of per-image GT means = {cv:.4f}")
-    print("-> fixed global scaling (scale_constant=1.0)" if cv < 0.15
-          else "-> range drifts across images; consider dataset-level z-score")
+    print("-> per-image GT means are tightly grouped" if cv < 0.15
+          else "-> per-image GT means vary widely")
+    print("   NOTE: GT is already normalised to [0,1] by KLA, so a high CV here")
+    print("   reflects genuine CONTENT diversity (different structures have")
+    print("   different brightness), not a calibration problem to correct.")
+    print("   Keep scale_constant=1.0. Per-image normalisation is the classic")
+    print("   out-of-distribution failure mode and there is nothing to gain here.")
 
     stats = {
         "scale_constant": 1.0,
