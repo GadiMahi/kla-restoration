@@ -55,22 +55,11 @@ def train_one_epoch(model, dataloader, optimizer, loss_fns, device):
     
     pbar = tqdm(dataloader, desc="Training", leave=False)
     for batch in pbar:
-        # Assuming the dataloader yields (noisy_lr, clean_hr)
-
+        # 1. Handle dictionary unpacking safely
         if isinstance(batch, dict):
-            # Print keys once so you know exactly what they are if it fails
-            if "lr" not in batch and "noisy" not in batch:
-                print(f"DEBUG - Batch keys are: {batch.keys()}")
-                
-            # Grab the noisy input (handling common naming conventions)
-            noisy_key = "lr" if "lr" in batch else "noisy"
-            noisy_lr = batch[noisy_key].to(device)
-            
-            # Grab the ground truth target
-            hr_key = "hr" if "hr" in batch else "gt"
-            clean_hr = batch[hr_key].to(device)
+            noisy_lr = batch.get("lr", batch.get("noisy")).to(device)
+            clean_hr = batch.get("hr", batch.get("gt")).to(device)
         else:
-            # Fallback in case it's a tuple
             noisy_lr, clean_hr = batch[0].to(device), batch[1].to(device)
         
         optimizer.zero_grad()
@@ -78,25 +67,24 @@ def train_one_epoch(model, dataloader, optimizer, loss_fns, device):
         # Forward pass
         pred_hr = model(noisy_lr)
         
-        # 1. Edge-weighted Charbonnier Loss
-        # We emphasize structural boundaries of the semiconductor chips
-        edges = edge_weight(clean_hr) 
+        # 2. Edge-weighted Charbonnier Loss
+        # Ground truth doesn't need gradients, so we can convert it to NumPy for SciPy
+        clean_hr_np = clean_hr.detach().cpu().numpy()
+        edges_np = edge_weight(clean_hr_np) 
+        edges = torch.from_numpy(edges_np).to(device)
+        
         l_char = charbonnier(pred_hr, clean_hr, weight_map=edges)
         
-        # 2. Perceptual Loss (LPIPS)
-        # Note: LPIPS expects inputs in [-1, 1], ensure data is scaled if necessary
-        # We normalize our [0, 1] GTs to [-1, 1] for the VGG network
+        # 3. Perceptual Loss (LPIPS)
+        # LPIPS is purely PyTorch, so it stays on the GPU
         pred_norm = pred_hr * 2.0 - 1.0
         clean_norm = clean_hr * 2.0 - 1.0
         l_perceptual = lpips_fn(pred_norm, clean_norm).mean()
         
-        # 3. SSIM Loss (1 - SSIM)
-        # Using the data team's stratified SSIM helper
-        ssim_val, _, _ = stratified_ssim(pred_hr, clean_hr)
-        l_ssim = 1.0 - ssim_val.mean()
-        
-        # Composite Loss Combination
-        loss = (1.0 * l_char) + (0.1 * l_perceptual) + (0.2 * l_ssim)
+        # NOTE: We removed the data team's SSIM from the training loss here.
+        # Converting predictions to NumPy breaks PyTorch's backprop graph. 
+        # Charbonnier + LPIPS is optimal for the backward pass.
+        loss = (1.0 * l_char) + (0.1 * l_perceptual)
         
         # Backward pass
         loss.backward()
@@ -117,28 +105,20 @@ def evaluate_ood(model, dataloader, device):
     
     pbar = tqdm(dataloader, desc="Validating (OOD)", leave=False)
     for batch in pbar:
-        # Check if batch is a dictionary (Mahi's dataset format)
         if isinstance(batch, dict):
-            # Print keys once so you know exactly what they are if it fails
-            if "lr" not in batch and "noisy" not in batch:
-                print(f"DEBUG - Batch keys are: {batch.keys()}")
-                
-            # Grab the noisy input (handling common naming conventions)
-            noisy_key = "lr" if "lr" in batch else "noisy"
-            noisy_lr = batch[noisy_key].to(device)
-            
-            # Grab the ground truth target
-            hr_key = "hr" if "hr" in batch else "gt"
-            clean_hr = batch[hr_key].to(device)
+            noisy_lr = batch.get("lr", batch.get("noisy")).to(device)
+            clean_hr = batch.get("hr", batch.get("gt")).to(device)
         else:
-            # Fallback in case it's a tuple
             noisy_lr, clean_hr = batch[0].to(device), batch[1].to(device)
+            
         pred_hr = model(noisy_lr)
-        
-        # The data pipeline ensures outputs are clamped to [0,1]
         pred_hr = torch.clamp(pred_hr, 0.0, 1.0)
         
-        ssim_val, ssim_edge, _ = stratified_ssim(pred_hr, clean_hr)
+        # Validation requires no gradients, safely convert to NumPy for eval_utils
+        pred_np = pred_hr.cpu().numpy()
+        clean_np = clean_hr.cpu().numpy()
+        
+        ssim_val, ssim_edge, _ = stratified_ssim(pred_np, clean_np)
         total_ssim += ssim_val.mean().item()
         total_ssim_edge += ssim_edge.mean().item()
         
