@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torchinfo import summary
 
+import numpy as np
 from src.config import add_config_args, load_config
 from src.dataset import RestorationDataset
 from src.splits import load_splits
@@ -68,22 +69,24 @@ def train_one_epoch(model, dataloader, optimizer, loss_fns, device):
         pred_hr = model(noisy_lr)
         
         # 2. Edge-weighted Charbonnier Loss
-        # Ground truth doesn't need gradients, so we can convert it to NumPy for SciPy
         clean_hr_np = clean_hr.detach().cpu().numpy()
-        edges_np = edge_weight(clean_hr_np) 
+        
+        # FIX: The data team's edge_weight expects a 2D image (H, W). 
+        # We loop through the batch to apply it correctly per image.
+        import numpy as np # Fallback import just in case
+        edges_np = np.zeros_like(clean_hr_np)
+        for i in range(clean_hr_np.shape[0]):
+            edges_np[i, 0] = edge_weight(clean_hr_np[i, 0])
+            
         edges = torch.from_numpy(edges_np).to(device)
         
         l_char = charbonnier(pred_hr, clean_hr, weight_map=edges)
         
         # 3. Perceptual Loss (LPIPS)
-        # LPIPS is purely PyTorch, so it stays on the GPU
         pred_norm = pred_hr * 2.0 - 1.0
         clean_norm = clean_hr * 2.0 - 1.0
         l_perceptual = lpips_fn(pred_norm, clean_norm).mean()
         
-        # NOTE: We removed the data team's SSIM from the training loss here.
-        # Converting predictions to NumPy breaks PyTorch's backprop graph. 
-        # Charbonnier + LPIPS is optimal for the backward pass.
         loss = (1.0 * l_char) + (0.1 * l_perceptual)
         
         # Backward pass
@@ -114,13 +117,15 @@ def evaluate_ood(model, dataloader, device):
         pred_hr = model(noisy_lr)
         pred_hr = torch.clamp(pred_hr, 0.0, 1.0)
         
-        # Validation requires no gradients, safely convert to NumPy for eval_utils
-        pred_np = pred_hr.cpu().numpy()
-        clean_np = clean_hr.cpu().numpy()
+        # FIX: Squeeze out the Batch and Channel dimensions (1, 1, H, W) -> (H, W)
+        # so skimage structural_similarity works correctly.
+        pred_np = pred_hr.cpu().numpy()[0, 0]
+        clean_np = clean_hr.cpu().numpy()[0, 0]
         
         ssim_val, ssim_edge, _ = stratified_ssim(pred_np, clean_np)
-        total_ssim += ssim_val.mean().item()
-        total_ssim_edge += ssim_edge.mean().item()
+        
+        total_ssim += ssim_val
+        total_ssim_edge += ssim_edge
         
     avg_ssim = total_ssim / len(dataloader)
     avg_ssim_edge = total_ssim_edge / len(dataloader)
