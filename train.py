@@ -31,10 +31,6 @@ class CharbonnierLoss(nn.Module):
         return torch.mean(torch.sqrt((pred - target)**2 + self.eps**2))
 
 class SobelEdgeLoss(nn.Module):
-    """
-    Computes spatial gradients (edges) directly in PyTorch.
-    Forces the network to output sharp edges instead of blurring them.
-    """
     def __init__(self):
         super().__init__()
         kernel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).view(1, 1, 3, 3)
@@ -68,19 +64,19 @@ def train_one_epoch(model, dataloader, optimizer, loss_fns, device):
         optimizer.zero_grad()
         pred_hr = model(noisy_lr)
         
-        # 1. Base Pixel Loss
+        # 1. Pixel Fidelity Loss (Primary driver for contrast and exact intensities)
         l_char = charbonnier(pred_hr, clean_hr)
         
-        # 2. Perceptual Loss (Scaled to [-1, 1])
+        # 2. Perceptual Loss (Scaled down to 0.05 so it doesn't destroy pixel contrast)
         pred_norm = pred_hr * 2.0 - 1.0
         clean_norm = clean_hr * 2.0 - 1.0
         l_perceptual = lpips_fn(pred_norm, clean_norm).mean()
         
-        # 3. Structural Edge Loss (Differentiable)
+        # 3. Structural Edge Loss
         l_edge = sobel_loss(pred_hr, clean_hr)
         
-        # The Re-balanced Composite Loss
-        loss = (1.0 * l_char) + (1.5 * l_perceptual) + (0.5 * l_edge)
+        # Balanced Loss Combination
+        loss = (1.0 * l_char) + (0.05 * l_perceptual) + (0.5 * l_edge)
         
         loss.backward()
         optimizer.step()
@@ -107,7 +103,6 @@ def evaluate_ood(model, dataloader, device):
         pred_hr = model(noisy_lr)
         pred_hr = torch.clamp(pred_hr, 0.0, 1.0)
         
-        # Convert to numpy strictly for the evaluation metrics
         pred_np = pred_hr.cpu().numpy()[0, 0]
         clean_np = clean_hr.cpu().numpy()[0, 0]
         
@@ -169,9 +164,7 @@ def main() -> int:
     model = MODELS["nafnet"](scale=scale_factor).to(device)
     
     epochs = get_cfg("train.epochs", 100)
-    optimizer = optim.AdamW(model.parameters(), lr=get_cfg("train.lr", 2e-4), weight_decay=1e-4)
-    
-    # Cosine annealing ensures the model settles into fine details in later epochs
+    optimizer = optim.AdamW(model.parameters(), lr=get_cfg("train.lr", 5e-4), weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     
     charbonnier = CharbonnierLoss().to(device)
@@ -183,7 +176,7 @@ def main() -> int:
     loss_fns = (charbonnier, lpips_fn, sobel_loss)
     best_ood_ssim = 0.0
     
-    print(f"--- Starting Training Run (U-Net NAFNet) for {epochs} epochs on {device} ---")
+    print(f"--- Starting Training Run (High-Capacity U-Net NAFNet) for {epochs} epochs on {device} ---")
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, loss_fns, device)
         scheduler.step()

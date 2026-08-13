@@ -38,7 +38,6 @@ class BicubicUpsample(nn.Module):
         return F.interpolate(x, scale_factor=self.scale, mode="bicubic", align_corners=False)
 
 
-
 class LayerNorm2d(nn.Module):
     def __init__(self, channels, eps=1e-6):
         super().__init__()
@@ -102,22 +101,21 @@ class NAFNet_UNet(nn.Module):
         # Intro
         self.intro = nn.Conv2d(in_channels, dim, 3, 1, 1)
         
-        # Encoder
-        self.enc1 = NAFBlock(dim)
-        self.down = nn.Conv2d(dim, dim * 2, 3, 2, 1) # Downsample
-        self.enc2 = NAFBlock(dim * 2)
+        # Encoder (2 NAFBlocks per level)
+        self.enc1 = nn.Sequential(NAFBlock(dim), NAFBlock(dim))
+        self.down = nn.Conv2d(dim, dim * 2, 3, 2, 1) 
+        self.enc2 = nn.Sequential(NAFBlock(dim * 2), NAFBlock(dim * 2))
         
         # Middle
-        self.middle = NAFBlock(dim * 2)
+        self.middle = nn.Sequential(NAFBlock(dim * 2), NAFBlock(dim * 2))
         
         # Decoder
         self.up = nn.Sequential(
             nn.Conv2d(dim * 2, dim * 4, 3, 1, 1),
             nn.PixelShuffle(2)
         )
-        # 1x1 Conv to reduce channels after concat
         self.reduce = nn.Conv2d(dim * 2, dim, 1, 1, 0)
-        self.dec1 = NAFBlock(dim)
+        self.dec1 = nn.Sequential(NAFBlock(dim), NAFBlock(dim))
         
         # Upsampling Tail for Super Resolution
         self.upsample = nn.Sequential(
@@ -126,34 +124,32 @@ class NAFNet_UNet(nn.Module):
         )
 
     def forward(self, x):
-        # Global residual baseline
         shortcut = F.interpolate(x, scale_factor=self.scale, mode='bilinear', align_corners=False)
         
         out = self.intro(x)
         
-        # Encoder (Save skip connection)
+        # Encoder with skip connection
         skip = self.enc1(out) 
         out = self.down(skip)
         out = self.enc2(out)
         
-        # Middle
+        # Bottleneck
         out = self.middle(out)
         
-        # Decoder (Concat skip connection)
+        # Decoder
         out = self.up(out)
         out = torch.cat([out, skip], dim=1) 
         out = self.reduce(out)
         out = self.dec1(out)
         
-        # Final Upscale
+        # Final Upscaling Tail
         out = self.upsample(out)
-        
         return out + shortcut
 
 @register("nafnet")
 def _nafnet(scale=2, **kwargs):
-    # Initializes the new U-Shaped architecture
-    return NAFNet_UNet(in_channels=1, out_channels=1, dim=32, scale=scale)
+    return NAFNet_UNet(in_channels=1, out_channels=1, dim=64, scale=scale)
+
 @register("bicubic")
 def _bicubic(scale: int = 2, **_) -> nn.Module:
     return BicubicUpsample(scale)
