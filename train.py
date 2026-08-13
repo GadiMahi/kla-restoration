@@ -124,8 +124,8 @@ def evaluate_ood(model, dataloader, device):
         
         ssim_val, ssim_edge, _ = stratified_ssim(pred_np, clean_np)
         
-        total_ssim += ssim_val
-        total_ssim_edge += ssim_edge
+        total_ssim += float(ssim_val)
+        total_ssim_edge += float(ssim_edge)
         
     avg_ssim = total_ssim / len(dataloader)
     avg_ssim_edge = total_ssim_edge / len(dataloader)
