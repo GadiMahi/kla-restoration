@@ -61,4 +61,4 @@ inference:
   batch_size: 8
   device: cuda
   amp: true
-  pad_multiple: 16         # set by the model team (NAFNet stride)
+  pad_multiple: 8         # set by the model team (NAFNet stride)
