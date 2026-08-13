@@ -92,6 +92,24 @@ handled.
   Global SSIM hides line smearing. `ssim_edge` is the diagnostic that matters,
   given the spec's "do not blur the image to remove noise".
 
+**Synthetic augmentation** — the measured degradation is reproducible, so extra
+training pairs can be generated on the fly from the clean GT images:
+
+```python
+from src.dataset import RestorationDataset, degrade_cfg_from_stats
+
+ds = RestorationDataset(cache_dir, stems=sp["train"], lr_patch=64, grad_thresh=thr,
+                        synth_p=0.5,                       # half the batch synthesised
+                        degrade_cfg=degrade_cfg_from_stats(width=0.3),
+                        jitter_range=(0.7, 1.4))
+...
+ds.set_width(w)      # curriculum: ramp 0.3 -> 1.0 over training
+```
+
+`jitter_range` rescales the GT before degrading it, which varies apparent feature
+size. That is the main defence against the resolution gap: every training pair is
+256->128, but evaluation may include 512x512 content.
+
 **Validation** — `artifacts/splits.json` has `train`, `val_id` and `val_ood`.
 `val_ood` is an entire held-out structure cluster and is the **primary
 metric**; `val_id` is a sanity check. KLA's hidden test set contains
