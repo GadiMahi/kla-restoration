@@ -55,6 +55,9 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+import os
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+os.environ.setdefault("NCCL_IB_DISABLE", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -223,7 +226,8 @@ def _make_structural_loss(hr_hw, device, channel: int = 1):
 
 @torch.no_grad()
 def evaluate_ood(model, dataloader, device, amp_dtype, use_amp, channels_last):
-    model.eval()
+    eval_model = model.module if hasattr(model, "module") else model
+    eval_model.eval()
     total_ssim = 0.0
     total_ssim_edge = 0.0
 
@@ -231,7 +235,7 @@ def evaluate_ood(model, dataloader, device, amp_dtype, use_amp, channels_last):
     for batch in pbar:
         lr, hr = _get_batch(batch, device, channels_last)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            pred = torch.clamp(model(lr), 0.0, 1.0)
+            pred = torch.clamp(eval_model(lr), 0.0, 1.0)
 
         pred_np = pred.float().cpu().numpy()[0, 0]
         clean_np = hr.float().cpu().numpy()[0, 0]
@@ -433,10 +437,14 @@ def main() -> int:
 
     # Multi-GPU: wrap only the generator (see docstring point 4 for why the
     # discriminator stays single-device).
-    if num_gpus > 1:
+    use_multi_gpu = bool(get_cfg("train.multi_gpu", False)) and num_gpus > 1
+    if use_multi_gpu:
         print(f"[gpu] Wrapping generator with nn.DataParallel across {num_gpus} GPUs "
-              f"(effective batch size {batch_size} = {batch_size // num_gpus} per GPU).")
+            f"(effective batch size {batch_size} = {batch_size // num_gpus} per GPU).")
         model = nn.DataParallel(model)
+    else:
+        print(f"[gpu] Running on a single device ({device}) -- "
+            f"multi-GPU NCCL broadcast was unreliable on this Kaggle T4 x2 session.")
 
     sample_lr, sample_hr = _get_batch(next(iter(train_loader)), device, channels_last)
     structural_fn = _make_structural_loss(sample_hr.shape[-2:], device)
