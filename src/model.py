@@ -126,12 +126,21 @@ class NAFBlock(nn.Module):
     def forward(self, x):
         identity = x
         out = self.norm1(x)
-        out = self.conv3(self.sca(self.sg1(self.conv2(self.conv1(out)))))
+        
+        
+        out = self.conv1(out).contiguous()
+        out = self.conv2(out).contiguous()
+        out = self.sg1(out)
+        out = self.sca(out)
+        out = self.conv3(out)
         x = identity + out * self.beta
 
         identity2 = x
         out = self.norm2(x)
-        out = self.conv5(self.sg2(self.conv4(out)))
+
+        out = self.conv4(out).contiguous()
+        out = self.sg2(out)
+        out = self.conv5(out)
         return identity2 + out * self.gamma
 
 
