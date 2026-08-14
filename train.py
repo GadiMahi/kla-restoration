@@ -156,12 +156,19 @@ class RelativisticAverageGANLoss(nn.Module):
 # --------------------------------------------------------------------------
 
 def get_amp_dtype(device: torch.device) -> torch.dtype:
-    """bf16 on Ampere+ (A100/H100), fp16 elsewhere (T4/V100/P100)."""
+    """bf16 Tensor Cores require Ampere+ (compute capability >= 8.0).
+    torch.cuda.is_bf16_supported() is NOT a reliable check for this --
+    it falls back to 'can I allocate a bf16 tensor at all', which
+    succeeds on Turing/Volta via unaccelerated software paths and will
+    happily tell you bf16 is 'supported' on a T4. Check the hardware
+    generation directly instead.
+    """
     if device.type != "cuda":
         return torch.float32
-    if torch.cuda.is_bf16_supported():
+    major, _minor = torch.cuda.get_device_capability(device)
+    if major >= 8:  # Ampere (A100/RTX30xx+), Hopper (H100), etc.
         return torch.bfloat16
-    return torch.float16
+    return torch.float16  # Turing (T4), Volta (V100), Pascal (P100)
 
 
 def to_channels_last(*tensors, enabled: bool):
