@@ -289,12 +289,10 @@ def main() -> int:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # cuDNN engine stability fix for depthwise convolutions on T4
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.enabled = False
 
     def get_cfg(key, default=None):
         if hasattr(cfg, "get_path"):
