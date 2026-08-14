@@ -278,12 +278,15 @@ def train_one_epoch_stage2(gen, disc, dataloader, opt_g, opt_d, loss_fns, weight
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
 
 def main() -> int:
     ap = add_config_args(argparse.ArgumentParser(description=__doc__))
     ap.add_argument("--stage", type=int, choices=[1, 2], default=None,
-                     help="1 = pixel/structure prior, 2 = GAN fine-tune. "
-                          "Overrides train.stage in config if given.")
+                    help="1 = pixel/structure prior, 2 = GAN fine-tune. "
+                         "Overrides train.stage in config if given.")
     args = ap.parse_args()
     cfg = load_config(args.config, args.overrides)
 
@@ -341,9 +344,15 @@ def main() -> int:
         num_heads=get_cfg("model.num_heads", 4),
         use_log_input=get_cfg("model.use_log_input", True),
     )
+    
     model = MODELS["nafnet"](**model_kwargs).to(device)
     if use_amp:
         model = model.to(memory_format=torch.channels_last)
+
+    # 🚀 MULTI-GPU WRAPPER FOR GENERATOR
+    if torch.cuda.device_count() > 1:
+        print(f"Accelerating Generator with {torch.cuda.device_count()} GPUs!")
+        model = nn.DataParallel(model)
 
     # Peek one batch to size the structural loss correctly.
     sample_lr, sample_hr = _get_batch(next(iter(train_loader)), device)
@@ -384,7 +393,9 @@ def main() -> int:
             if ood_ssim > best_ood_ssim:
                 best_ood_ssim = ood_ssim
                 save_path = output_dir / "best_nafnet.pt"
-                torch.save(model.state_dict(), save_path)
+                # Safely extract state_dict bypassing DataParallel wrapper
+                state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+                torch.save(state_dict, save_path)
                 print(f" -> Checkpoint saved to {save_path}")
 
     else:  # stage == 2
@@ -393,12 +404,20 @@ def main() -> int:
             raise FileNotFoundError(
                 f"Stage 2 needs a Stage 1 checkpoint -- none found at {stage1_ckpt}. "
                 f"Run `--stage 1` first, or pass train.stage1_ckpt=<path> via --overrides.")
-        model.load_state_dict(torch.load(stage1_ckpt, map_location=device))
+        
+        # Load weights safely into the base model 
+        base_model = model.module if hasattr(model, "module") else model
+        base_model.load_state_dict(torch.load(stage1_ckpt, map_location=device))
         print(f"Loaded Stage 1 weights from {stage1_ckpt}")
 
         disc = UNetDiscriminatorSN(in_channels=1, base_dim=get_cfg("model.disc_base_dim", 32)).to(device)
         if use_amp:
             disc = disc.to(memory_format=torch.channels_last)
+            
+        # 🚀 MULTI-GPU WRAPPER FOR DISCRIMINATOR
+        if torch.cuda.device_count() > 1:
+            print(f"Accelerating Discriminator with {torch.cuda.device_count()} GPUs!")
+            disc = nn.DataParallel(disc)
 
         epochs = get_cfg("train.stage2_epochs", 20)
         lr_g = get_cfg("train.stage2_lr_g", 1e-4)
@@ -407,7 +426,7 @@ def main() -> int:
         opt_d = optim.AdamW(disc.parameters(), lr=lr_d, weight_decay=1e-4)
 
         weights = (
-            get_cfg("train.stage2_w_char", 0.5),   # anchor, not zero -- stops GAN reintroducing speckle
+            get_cfg("train.stage2_w_char", 0.5),   
             get_cfg("train.stage2_w_lpips", 0.4),
             get_cfg("train.stage2_w_edge", 0.3),
             get_cfg("train.stage2_w_struct", 0.2),
@@ -431,11 +450,12 @@ def main() -> int:
             if ood_ssim > best_ood_ssim:
                 best_ood_ssim = ood_ssim
                 save_path = output_dir / "best_nafnet_gan.pt"
-                torch.save(model.state_dict(), save_path)
+                # Safely extract state_dict bypassing DataParallel wrapper
+                state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+                torch.save(state_dict, save_path)
                 print(f" -> Checkpoint saved to {save_path}")
 
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
