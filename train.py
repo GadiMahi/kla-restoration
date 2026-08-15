@@ -459,7 +459,8 @@ def main() -> int:
 
     if stage == 1:
         epochs = get_cfg("train.epochs", 100)
-        optimizer = optim.AdamW(model.parameters(), lr=get_cfg("train.lr", 2e-4), weight_decay=1e-4)
+        # Cast the parsed learning rate to a float
+        optimizer = optim.AdamW(model.parameters(), lr=float(get_cfg("train.lr", 2e-4)), weight_decay=1e-4)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
         scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
 
@@ -508,8 +509,9 @@ def main() -> int:
         # NOTE: intentionally NOT wrapped in DataParallel -- see docstring.
 
         epochs = get_cfg("train.stage2_epochs", 20)
-        lr_g = get_cfg("train.stage2_lr_g", 1e-4)
-        lr_d = get_cfg("train.stage2_lr_d", 4e-4)  # TTUR: D learns faster than G
+        # Cast both GAN learning rates to floats
+        lr_g = float(get_cfg("train.stage2_lr_g", 1e-4))
+        lr_d = float(get_cfg("train.stage2_lr_d", 4e-4)) # TTUR: D learns faster than G
         opt_g = optim.AdamW(model.parameters(), lr=lr_g, weight_decay=1e-4)
         opt_d = optim.AdamW(disc.parameters(), lr=lr_d, weight_decay=1e-4)
         scaler_g = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
