@@ -247,7 +247,7 @@ def main() -> int:
         num_workers=args.workers, pin_memory=True,
     )
 
-    model = MODELS["nafnet"](scale=args.scale).to(device)
+    model = MODELS["nafnet_v2"](scale=args.scale).to(device)
 
     if args.resume:
         state = torch.load(args.resume, map_location=device)
