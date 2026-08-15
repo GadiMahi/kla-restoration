@@ -47,9 +47,14 @@ class LayerNorm2d(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        mu = x.mean(dim=1, keepdim=True)
-        sigma = x.var(dim=1, keepdim=True, unbiased=False)
-        return (x - mu) / torch.sqrt(sigma + self.eps) * self.weight + self.bias
+        # FIX: Force float32 so 1e-6 doesn't underflow to 0.0 in mixed precision
+        x_f32 = x.float()
+        mu = x_f32.mean(dim=1, keepdim=True)
+        sigma = x_f32.var(dim=1, keepdim=True, unbiased=False)
+        out = (x_f32 - mu) / torch.sqrt(sigma + self.eps)
+        
+        # Cast back to original dtype for speed
+        return (out.type_as(x) * self.weight) + self.bias
 
 class SimpleGate(nn.Module):
     def forward(self, x):
@@ -131,11 +136,13 @@ class MDTA(nn.Module):
         k = F.normalize(k, dim=-1)
 
         attn = (q @ k.transpose(-2, -1)) * self.temperature
-        attn = attn.softmax(dim=-1)
+        
+        # FIX: Force float32 for softmax stability, preventing attention collapse
+        attn = attn.float().softmax(dim=-1).type_as(attn)
+        
         out = attn @ v
         out = out.reshape(b, c, h, w)
         return self.project_out(out)
-
 class GDFN(nn.Module):
     def __init__(self, dim, expansion: float = 2.66):
         super().__init__()
