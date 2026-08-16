@@ -50,7 +50,7 @@ from src.eval_utils import stratified_ssim
 import lpips
 
 try:
-    from pytorch_msssim import ms_ssim
+    from pytorch_msssim import ms_ssim, ssim
 except ImportError as e:
     raise ImportError(
         "pytorch-msssim is required for the MS-SSIM loss term.\n"
@@ -85,17 +85,21 @@ class SobelEdgeLoss(nn.Module):
 
 
 class MSSSIMLoss(nn.Module):
-    """1 - MS-SSIM. Fully differentiable, GPU-native, and literally the
-    competition's primary metric -- optimizing it directly (instead of
-    only proxying it via Charbonnier + edges) tends to close the gap
-    between train loss and the eval SSIM/Edge-SSIM numbers you actually
-    get scored on."""
+    """1 - MS-SSIM. Fully differentiable, GPU-native.
+    Dynamically falls back to single-scale SSIM if the image patch 
+    is smaller than 160x160 (since MS-SSIM requires 4 downsamplings)."""
     def __init__(self, data_range=1.0):
         super().__init__()
         self.data_range = data_range
 
     def forward(self, pred, target):
-        return 1.0 - ms_ssim(pred, target, data_range=self.data_range, size_average=True)
+        # Check the smallest spatial dimension (Height or Width)
+        min_side = min(pred.shape[-2], pred.shape[-1])
+        
+        if min_side >= 160:
+            return 1.0 - ms_ssim(pred, target, data_range=self.data_range, size_average=True)
+        else:
+            return 1.0 - ssim(pred, target, data_range=self.data_range, size_average=True)
 
 
 class HighFrequencyLoss(nn.Module):
