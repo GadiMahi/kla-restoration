@@ -1,37 +1,76 @@
 #!/usr/bin/env python3
 """
-v2 changes from the original train.py:
-  1. Multi-GPU: wraps the model in nn.DataParallel when >1 GPU is visible
-     (e.g. Kaggle T4x2). No script/CLI changes needed -- DataParallel
-     splits whatever --set train.batch_size=N you pass across the visible
-     GPUs automatically. Safe here because NAFBlock uses per-sample
-     LayerNorm2d, not BatchNorm, so there's no cross-GPU stat-sync pitfall
-     to worry about.
-  2. AMP (mixed precision) on top of that for T4 throughput. The
-     numerically sensitive losses (LPIPS, MS-SSIM, high-freq) are forced
-     back to fp32 inside the autocast region since SSIM-style losses and
-     VGG-based LPIPS are known to be unstable in fp16.
-  3. Loss function: added a differentiable MS-SSIM term (pytorch-msssim,
-     GPU-native, no numpy round-trip -- unlike skimage SSIM, which is why
-     it broke autograd before) and a high-frequency texture loss aimed
-     directly at the "painterly" over-smoothing problem. Sobel edge
-     weight was reduced since MS-SSIM already covers structure/edges to
-     some degree and stacking both at full weight over-constrains.
-  4. Checkpoints are always saved as a plain (unwrapped) state_dict, so a
-     model trained with DataParallel loads cleanly in a single-GPU
-     inference script with no key-prefix surgery needed.
+v3 changes from v2 (fixes the Kaggle T4x2 OOM):
 
-Everything else (config loading, dataset/splits, checkpoint logic) is
-untouched from the original script -- only paste this over your existing
-train.py, no other files need to change except src/model.py.
+Root cause: with plain nn.DataParallel, only the model's forward/backward
+is split across GPUs. The five loss functions (Charbonnier, LPIPS, Sobel,
+MS-SSIM, HF) all ran *after* DataParallel had already gathered every
+replica's prediction back onto GPU 0 -- so the whole batch (all N samples,
+not the N/2-per-GPU split) went through LPIPS's VGG16 forward *and*
+backward on a single GPU. That's the actual OOM trigger, not simply
+"batch size is too big": GPU 0 was doing roughly 2x the memory work of
+GPU 1 every step, so GPU 0 OOMs while GPU 1 still has headroom.
 
-Install the one new dependency: pip install pytorch-msssim
+Fixes, in order of impact:
+  1. ModelWithLoss: model forward + all five losses now happen *inside*
+     the module that gets wrapped by DataParallel, so each GPU computes
+     its own loss (including the LPIPS VGG backward graph) only for its
+     own batch shard. Only a per-GPU scalar loss gets gathered back to
+     GPU 0 every step, not the full-resolution prediction tensor plus
+     its whole backward graph. This alone should roughly halve GPU 0's
+     peak memory under 2 GPUs.
+  2. Optional gradient checkpointing (train.grad_checkpoint, default
+     True) on the NAFBlock stacks -- trades ~20-30% more compute for a
+     large cut in activation memory, which is what lets you push batch
+     size back up instead of running tiny/slow batches. See model.py.
+  3. Gradient accumulation (train.accum_steps, default 1) decouples the
+     physical (memory) batch size from the effective (optimization)
+     batch size, e.g. batch_size=16, accum_steps=8 behaves like batch
+     128 for training dynamics without ever materializing 128 samples'
+     worth of activations at once.
+  4. LPIPS now runs *inside* the AMP autocast region (fp16) instead of
+     being forced to fp32. VGG-backbone perceptual losses are generally
+     fine under fp16 in practice (unlike MS-SSIM's log/sqrt multi-scale
+     math, which stays fp32 -- that one's still genuinely fp16-fragile).
+     LPIPS was the single most expensive part of the loss stack, so this
+     roughly halves its memory too. If you see NaN losses, move
+     `l_perceptual` back into the fp32 block below.
+  5. cudnn.benchmark=True (fixed input sizes across a run -> free
+     speedup) and PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (cuts
+     OOM from allocator fragmentation, which gets worse when tensor
+     shapes vary between the fp16 and fp32 loss blocks every step).
+  6. evaluate_ood now runs on the raw (unwrapped) model directly instead
+     of through DataParallel -- eval batch size is 1, so routing it
+     through DataParallel's scatter/gather was pure dispatch overhead
+     with zero parallelism benefit.
+
+CLI/config schema unchanged except two new optional keys:
+  --set train.grad_checkpoint=true/false   (default true)
+  --set train.accum_steps=N                (default 1)
+Everything else (config loading, dataset/splits, checkpoint format) is
+unchanged. Paste this over train.py; pair it with the updated model.py
+(NAFNet_UNet gained a use_checkpoint flag, forward pass unchanged
+numerically).
+
+If you're still OOMing after this: lower train.batch_size and raise
+train.accum_steps to compensate for the same effective batch at lower
+peak memory, e.g. batch_size=8, accum_steps=16 for an effective batch
+of 128. If the error is a Kaggle "kernel restarted" message rather than
+a "CUDA out of memory" traceback, that's system RAM, not VRAM, and a
+different problem (likely something in RestorationDataset/caching) --
+none of the fixes here target that.
 """
 from __future__ import annotations
 import argparse
 import sys
 import os
 from pathlib import Path
+
+# Must be set before CUDA initializes (i.e. before `import torch`).
+# Reduces OOM caused by allocator fragmentation, not just raw usage --
+# relevant here since tensor shapes vary between the fp16 model/LPIPS
+# path and the fp32 MS-SSIM/HF path every single step.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -57,7 +96,7 @@ except ImportError as e:
         "Install with: pip install pytorch-msssim"
     ) from e
 
-# --- PyTorch Native Losses ---
+# --- PyTorch Native Losses (unchanged from v2) ---
 
 class CharbonnierLoss(nn.Module):
     def __init__(self, eps=1e-3):
@@ -85,17 +124,13 @@ class SobelEdgeLoss(nn.Module):
 
 
 class MSSSIMLoss(nn.Module):
-    """1 - MS-SSIM. Fully differentiable, GPU-native.
-    Dynamically falls back to single-scale SSIM if the image patch 
-    is smaller than 160x160 (since MS-SSIM requires 4 downsamplings)."""
+    """1 - MS-SSIM. Stays in fp32 (see module docstring point 4)."""
     def __init__(self, data_range=1.0):
         super().__init__()
         self.data_range = data_range
 
     def forward(self, pred, target):
-        # Check the smallest spatial dimension (Height or Width)
         min_side = min(pred.shape[-2], pred.shape[-1])
-        
         if min_side >= 160:
             return 1.0 - ms_ssim(pred, target, data_range=self.data_range, size_average=True)
         else:
@@ -103,16 +138,7 @@ class MSSSIMLoss(nn.Module):
 
 
 class HighFrequencyLoss(nn.Module):
-    """L1 loss on the high-frequency residual (image minus a Gaussian-
-    blurred version of itself). This is the direct fix for the
-    "painterly / plastic" over-smoothing: pixel losses like Charbonnier
-    are minimized on average by regressing to a smooth mean whenever the
-    exact high-frequency detail is ambiguous, which is exactly what
-    happens with texture. This loss explicitly rewards matching the
-    *amount* of local high-frequency energy, not just low-frequency
-    structure. It can't reintroduce speckle noise because the target
-    side is always the clean HR ground truth -- the network is never
-    shown a noisy high-frequency target to chase."""
+    """L1 on the high-frequency residual. Unchanged from v2."""
     def __init__(self, kernel_size=5, sigma=1.5):
         super().__init__()
         coords = torch.arange(kernel_size).float() - kernel_size // 2
@@ -129,7 +155,52 @@ class HighFrequencyLoss(nn.Module):
         return self.l1(pred - pred_blur, target - target_blur)
 
 
-# --- Padding helpers (fully-conv model, arbitrary input size incl. 512) ---
+class ModelWithLoss(nn.Module):
+    """Wraps model forward + every loss term in one module so DataParallel
+    parallelizes the *whole* thing (including the LPIPS VGG backward
+    graph) across GPUs, instead of gathering predictions to GPU 0 first
+    and paying for loss compute there alone. See module docstring point 1."""
+
+    def __init__(self, model, loss_weights):
+        super().__init__()
+        self.model = model
+        self.charbonnier = CharbonnierLoss()
+        self.sobel_loss = SobelEdgeLoss()
+        self.msssim_loss = MSSSIMLoss()
+        self.hf_loss = HighFrequencyLoss()
+        self.lpips_fn = lpips.LPIPS(net='vgg')
+        for p in self.lpips_fn.parameters():
+            p.requires_grad = False
+        self.w = loss_weights
+
+    def forward(self, noisy_lr, clean_hr, amp_enabled: bool):
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            pred_hr = self.model(noisy_lr)
+            l_char = self.charbonnier(pred_hr, clean_hr)
+            l_edge = self.sobel_loss(pred_hr, clean_hr)
+            # LPIPS stays in the fp16 region now -- see point 4 above.
+            pred_norm = pred_hr * 2.0 - 1.0
+            clean_norm = clean_hr * 2.0 - 1.0
+            l_perceptual = self.lpips_fn(pred_norm, clean_norm).mean()
+
+        # Only MS-SSIM / HF forced to fp32 now -- they're cheap (no VGG),
+        # so fp32 here costs little, unlike forcing LPIPS to fp32 did.
+        with torch.cuda.amp.autocast(enabled=False):
+            pred_f = pred_hr.float()
+            clean_f = clean_hr.float()
+            l_msssim = self.msssim_loss(pred_f, clean_f)
+            l_hf = self.hf_loss(pred_f, clean_f)
+
+        loss = (self.w["char"] * l_char + self.w["lpips"] * l_perceptual + self.w["edge"] * l_edge
+                + self.w["msssim"] * l_msssim + self.w["hf"] * l_hf)
+
+        # Shape (1,) per replica -> DataParallel gathers to (n_gpus,) on
+        # the primary device; caller takes .mean(). This scalar is the
+        # only thing that crosses GPUs every step now, not the prediction.
+        return loss.unsqueeze(0)
+
+
+# --- Padding helpers (unchanged from v2) ---
 
 def pad_to_multiple(x: torch.Tensor, multiple: int = 4):
     h, w = x.shape[-2:]
@@ -147,22 +218,27 @@ def crop_to_scale(x: torch.Tensor, pad_h: int, pad_w: int, scale: int):
     return x[..., : h - pad_h * scale, : w - pad_w * scale]
 
 
-def unwrap(model: nn.Module) -> nn.Module:
-    """Returns the underlying module whether or not it's DataParallel-wrapped."""
-    return model.module if hasattr(model, "module") else model
+def get_raw_model(m: nn.Module) -> nn.Module:
+    """Unwraps DataParallel and then the ModelWithLoss shim to get the
+    plain NAFNet -- what you want for eval and for the saved checkpoint."""
+    if hasattr(m, "module"):
+        m = m.module
+    if hasattr(m, "model"):
+        m = m.model
+    return m
 
 
 # --- Core Loop ---
 
-def train_one_epoch(model, dataloader, optimizer, loss_fns, loss_weights, device, scaler):
-    model.train()
+def train_one_epoch(model_with_loss, dataloader, optimizer, device, scaler,
+                     amp_enabled: bool, accum_steps: int):
+    model_with_loss.train()
     total_loss = 0.0
-    charbonnier, lpips_fn, sobel_loss, msssim_loss, hf_loss = loss_fns
-    w = loss_weights
-    amp_enabled = scaler.is_enabled()
+    optimizer.zero_grad(set_to_none=True)
+    n_batches = len(dataloader)
 
     pbar = tqdm(dataloader, desc="Training", leave=False)
-    for batch in pbar:
+    for step, batch in enumerate(pbar):
         if isinstance(batch, dict):
             noisy_lr = batch.get("lr", batch.get("noisy")).to(device, non_blocking=True)
             clean_hr = batch.get("hr", batch.get("gt")).to(device, non_blocking=True)
@@ -170,39 +246,26 @@ def train_one_epoch(model, dataloader, optimizer, loss_fns, loss_weights, device
             noisy_lr = batch[0].to(device, non_blocking=True)
             clean_hr = batch[1].to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
+        per_gpu_loss = model_with_loss(noisy_lr, clean_hr, amp_enabled)
+        loss = per_gpu_loss.mean()
 
-        with torch.cuda.amp.autocast(enabled=amp_enabled):
-            pred_hr = model(noisy_lr)
-            l_char = charbonnier(pred_hr, clean_hr)
-            l_edge = sobel_loss(pred_hr, clean_hr)
+        scaler.scale(loss / accum_steps).backward()
 
-        # Numerically sensitive losses forced to fp32 even under AMP.
-        with torch.cuda.amp.autocast(enabled=False):
-            pred_f = pred_hr.float()
-            clean_f = clean_hr.float()
-            pred_norm = pred_f * 2.0 - 1.0
-            clean_norm = clean_f * 2.0 - 1.0
-            l_perceptual = lpips_fn(pred_norm, clean_norm).mean()
-            l_msssim = msssim_loss(pred_f, clean_f)
-            l_hf = hf_loss(pred_f, clean_f)
-
-        loss = (w["char"] * l_char + w["lpips"] * l_perceptual + w["edge"] * l_edge
-                + w["msssim"] * l_msssim + w["hf"] * l_hf)
-
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        is_last_batch = (step + 1) == n_batches
+        if (step + 1) % accum_steps == 0 or is_last_batch:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         total_loss += loss.item()
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-    return total_loss / len(dataloader)
+    return total_loss / n_batches
 
 
 @torch.no_grad()
-def evaluate_ood(model, dataloader, device, scale: int):
-    model.eval()
+def evaluate_ood(raw_model, dataloader, device, scale: int):
+    raw_model.eval()
     total_ssim = 0.0
     total_ssim_edge = 0.0
 
@@ -218,7 +281,7 @@ def evaluate_ood(model, dataloader, device, scale: int):
         # size, but this keeps eval robust if that ever changes (e.g.
         # mixed-resolution OOD samples).
         noisy_lr_p, (ph, pw) = pad_to_multiple(noisy_lr, multiple=4)
-        pred_hr = model(noisy_lr_p)
+        pred_hr = raw_model(noisy_lr_p)
         pred_hr = crop_to_scale(pred_hr, ph, pw, scale=scale)
         pred_hr = torch.clamp(pred_hr, 0.0, 1.0)
 
@@ -245,6 +308,8 @@ def main() -> int:
     cfg = load_config(args.config, args.overrides)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True  # fixed input sizes -> free speedup
 
     def get_cfg(key, default=None):
         if hasattr(cfg, "get_path"):
@@ -272,12 +337,14 @@ def main() -> int:
     # was written. If your default already matches, this is a no-op; if it
     # doesn't, this is the difference between the synthetic-augmentation risk
     # mitigation actually running or silently not running.
-    
+
     train_ds = RestorationDataset(cache_dir, stems=sp["train"])
     val_ood_ds = RestorationDataset(cache_dir, stems=sp["val_ood"], train=False)
 
     batch_size = get_cfg("train.batch_size", 8)
     workers = get_cfg("train.num_workers", 4)
+    accum_steps = max(1, int(get_cfg("train.accum_steps", 1)))
+    use_checkpoint = bool(get_cfg("train.grad_checkpoint", True))
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
@@ -291,31 +358,11 @@ def main() -> int:
     )
 
     scale_factor = get_cfg("dataset.scale", 2)
-    model = MODELS["nafnet"](scale=scale_factor).to(device)
-
-    n_gpus = torch.cuda.device_count()
-    if n_gpus > 1:
-        print(f"--- Detected {n_gpus} GPUs -> wrapping model in nn.DataParallel ---")
-        model = nn.DataParallel(model)
+    model = MODELS["nafnet"](scale=scale_factor, use_checkpoint=use_checkpoint)
 
     epochs = get_cfg("train.epochs", 100)
-    optimizer = optim.AdamW(model.parameters(), lr=get_cfg("train.lr", 5e-4), weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-
     use_amp = bool(get_cfg("train.amp", True)) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-    if use_amp:
-        print("--- AMP (mixed precision) enabled ---")
 
-    charbonnier = CharbonnierLoss().to(device)
-    sobel_loss = SobelEdgeLoss().to(device)
-    msssim_loss = MSSSIMLoss().to(device)
-    hf_loss = HighFrequencyLoss().to(device)
-    lpips_fn = lpips.LPIPS(net='vgg').to(device)
-    for param in lpips_fn.parameters():
-        param.requires_grad = False
-
-    loss_fns = (charbonnier, lpips_fn, sobel_loss, msssim_loss, hf_loss)
     loss_weights = {
         "char":   float(get_cfg("train.loss.char_w", 1.0)),
         "lpips":  float(get_cfg("train.loss.lpips_w", 0.05)),
@@ -325,26 +372,58 @@ def main() -> int:
     }
     print(f"--- Loss weights: {loss_weights} ---")
 
+    model_with_loss = ModelWithLoss(model, loss_weights).to(device)
+
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1:
+        print(f"--- Detected {n_gpus} GPUs -> wrapping model+loss in nn.DataParallel ---")
+        print("    (loss is now computed per-GPU-shard, not gathered to GPU 0 first)")
+        model_with_loss = nn.DataParallel(model_with_loss)
+
+    trainable_params = [p for p in model_with_loss.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(trainable_params, lr=get_cfg("train.lr", 5e-4), weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    if use_amp:
+        print("--- AMP (mixed precision) enabled ---")
+    if use_checkpoint:
+        print("--- Gradient checkpointing enabled on NAFBlock stacks ---")
+    if accum_steps > 1:
+        effective_bs = batch_size * accum_steps
+        print(f"--- Gradient accumulation: physical batch {batch_size} x {accum_steps} "
+              f"steps = effective batch {effective_bs} ---")
+
     best_ood_ssim = 0.0
 
     print(f"--- Starting Training Run (3-level NAFNet) for {epochs} epochs on {device} "
           f"({n_gpus} GPU{'s' if n_gpus != 1 else ''}) ---")
     for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, loss_fns, loss_weights, device, scaler)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+
+        train_loss = train_one_epoch(
+            model_with_loss, train_loader, optimizer, device, scaler, use_amp, accum_steps
+        )
         scheduler.step()
 
-        ood_ssim, ood_ssim_edge = evaluate_ood(model, val_loader, device, scale=scale_factor)
+        raw_model = get_raw_model(model_with_loss)
+        ood_ssim, ood_ssim_edge = evaluate_ood(raw_model, val_loader, device, scale=scale_factor)
+
+        mem_str = ""
+        if device.type == "cuda":
+            peak_gb = torch.cuda.max_memory_allocated() / 1e9
+            mem_str = f" | Peak GPU0 mem: {peak_gb:.1f}GB"
 
         print(f"Epoch {epoch:03d}/{epochs:03d} | Loss: {train_loss:.4f} | "
-              f"OOD SSIM: {ood_ssim:.4f} | OOD Edge: {ood_ssim_edge:.4f}")
+              f"OOD SSIM: {ood_ssim:.4f} | OOD Edge: {ood_ssim_edge:.4f}{mem_str}")
 
         if ood_ssim > best_ood_ssim:
             best_ood_ssim = ood_ssim
             save_path = output_dir / "best_nafnet.pt"
-            # Always save the unwrapped state_dict so a DataParallel-trained
-            # checkpoint loads directly into a plain single-GPU model at
-            # inference time -- no "module." key surgery needed.
-            torch.save(unwrap(model).state_dict(), save_path)
+            # Always save the plain (unwrapped) state_dict so it loads
+            # directly into a plain single-GPU model at inference time.
+            torch.save(raw_model.state_dict(), save_path)
             print(f" -> Checkpoint saved to {save_path}")
 
     return 0

@@ -1,26 +1,26 @@
 """Model registry.
 
-v2 change: the previous NAFNet_UNet was described as a "4-level U-Net"
-but only implemented a single downsample/upsample pair (i.e. a 2-level
-U-Net: full-res + one half-res stage). That caps the bottleneck's
-effective receptive field at ~2x the input, which is a plausible reason
-the model over-smooths fine texture (grass, stone grain, water ripples)
-into a "painterly" look: at the bottleneck it doesn't have enough
-multi-scale context to tell "this high-frequency detail is speckle
-noise, average it out" from "this high-frequency detail is real
-texture, keep it". This version adds a second downsample/upsample stage
-(3 levels total: dim, dim*2, dim*4), which roughly quadruples the
-bottleneck's receptive field for a modest compute increase -- bottleneck
-NAFBlocks run at 1/16th the spatial resolution of the input, so they're
-cheap even though there are more of them. Everything else (NAFBlock
-internals, SimpleGate, LayerNorm2d, SCA, PixelShuffle SR tail, global
-residual) is unchanged from the original.
+v3 change (on top of v2's 3-level U-Net fix): optional gradient
+checkpointing on each encoder/decoder/bottleneck NAFBlock stack, gated
+by `use_checkpoint` (default False here; train.py passes True by
+default via train.grad_checkpoint). Trades ~20-30% recompute for a
+large cut in activation memory -- the full-res enc1/dec1 stacks hold
+the biggest activations (dim channels at full H,W) and benefit the
+most; enc3/middle/dec2 help less since they're already at lower
+resolution, but are checkpointed too since it's cheap to do. Only
+active during training (model.training=True) -- checkpointing during
+eval/inference is pure overhead with no memory pressure to relieve,
+since there's no backward pass to save activations for. NAFBlock
+internals, SimpleGate, LayerNorm2d, SCA, PixelShuffle SR tail, and the
+global residual are all unchanged from v2 -- checkpointing does not
+change the numerical output, only memory/compute trade-off.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # Single registry. (The original file had a second `_REGISTRY` dict that
 # `register()` never populated, so `build_model()` always raised KeyError
@@ -124,12 +124,17 @@ class NAFNet_UNet(nn.Module):
     arbitrary input sizes -- the network itself has no fixed-size
     assumptions, per the spec's requirement to generalize to 512x512
     eval images despite only training on 256->128 pairs.
+
+    `use_checkpoint=True` wraps each stage's NAFBlock stack in gradient
+    checkpointing during training (see module docstring) -- no effect
+    on outputs, only on the memory/compute trade-off.
     """
 
     def __init__(self, in_channels=1, out_channels=1, dim=64, scale=2,
-                 blocks=(2, 2, 2, 2, 2, 2)):
+                 blocks=(2, 2, 2, 2, 2, 2), use_checkpoint=False):
         super().__init__()
         self.scale = scale
+        self.use_checkpoint = use_checkpoint
         b_enc1, b_enc2, b_enc3, b_mid, b_dec2, b_dec1 = blocks
 
         self.intro = nn.Conv2d(in_channels, dim, 3, 1, 1)
@@ -166,30 +171,40 @@ class NAFNet_UNet(nn.Module):
             nn.PixelShuffle(scale),
         )
 
+    def _run(self, seq: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
+        """Runs a NAFBlock stack, checkpointing it during training if
+        use_checkpoint is set. use_reentrant=False is the modern,
+        recommended checkpoint mode; needs no other code changes here
+        since every checkpointed input already carries requires_grad=True
+        (it flows through self.intro's weights before reaching enc1)."""
+        if self.use_checkpoint and self.training:
+            return checkpoint(seq, x, use_reentrant=False)
+        return seq(x)
+
     def forward(self, x):
         shortcut = F.interpolate(x, scale_factor=self.scale, mode='bilinear', align_corners=False)
 
         out = self.intro(x)
 
-        skip1 = self.enc1(out)             # dim      @ H
-        out = self.down1(skip1)            # dim*2    @ H/2
-        skip2 = self.enc2(out)             # dim*2    @ H/2
-        out = self.down2(skip2)            # dim*4    @ H/4
-        out = self.enc3(out)               # dim*4    @ H/4
+        skip1 = self._run(self.enc1, out)          # dim      @ H
+        out = self.down1(skip1)                     # dim*2    @ H/2
+        skip2 = self._run(self.enc2, out)            # dim*2    @ H/2
+        out = self.down2(skip2)                      # dim*4    @ H/4
+        out = self._run(self.enc3, out)               # dim*4    @ H/4
 
-        out = self.middle(out)             # dim*4    @ H/4  (bottleneck)
+        out = self._run(self.middle, out)              # dim*4    @ H/4  (bottleneck)
 
-        out = self.up2(out)                # dim*2    @ H/2
-        out = torch.cat([out, skip2], dim=1)  # dim*4 @ H/2
-        out = self.reduce2(out)            # dim*2    @ H/2
-        out = self.dec2(out)
+        out = self.up2(out)                             # dim*2    @ H/2
+        out = torch.cat([out, skip2], dim=1)             # dim*4 @ H/2
+        out = self.reduce2(out)                          # dim*2    @ H/2
+        out = self._run(self.dec2, out)
 
-        out = self.up1(out)                # dim      @ H
-        out = torch.cat([out, skip1], dim=1)  # dim*2 @ H
-        out = self.reduce1(out)            # dim      @ H
-        out = self.dec1(out)
+        out = self.up1(out)                              # dim      @ H
+        out = torch.cat([out, skip1], dim=1)             # dim*2 @ H
+        out = self.reduce1(out)                          # dim      @ H
+        out = self._run(self.dec1, out)
 
-        out = self.upsample(out)           # out_channels @ H*scale
+        out = self.upsample(out)                         # out_channels @ H*scale
         return out + shortcut
 
 
