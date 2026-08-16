@@ -268,8 +268,8 @@ def main() -> int:
     # was written. If your default already matches, this is a no-op; if it
     # doesn't, this is the difference between the synthetic-augmentation risk
     # mitigation actually running or silently not running.
-    synth_p = float(get_cfg("train.synth_p", 0.5))
-    train_ds = RestorationDataset(cache_dir, stems=sp["train"], synth_p=synth_p)
+    
+    train_ds = RestorationDataset(cache_dir, stems=sp["train"])
     val_ood_ds = RestorationDataset(cache_dir, stems=sp["val_ood"], train=False)
 
     batch_size = get_cfg("train.batch_size", 8)
