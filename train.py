@@ -10,7 +10,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import lpips
-from pytorch_msssim import ms_ssim, ssim
+
+# Use the stateful modules, NOT the functional calls!
+from pytorch_msssim import SSIM, MS_SSIM
 
 from src.config import add_config_args, load_config
 from src.splits import load_splits
@@ -18,7 +20,7 @@ from src.dataset import RestorationDataset
 from src.model import MODELS
 from src.eval_utils import stratified_ssim
 
-# --- Restored PyTorch Native Losses ---
+# --- Memory-Safe PyTorch Losses ---
 
 class CharbonnierLoss(nn.Module):
     def __init__(self, eps=1e-3):
@@ -44,16 +46,14 @@ class SobelEdgeLoss(nn.Module):
         return self.l1(pred_x, target_x) + self.l1(pred_y, target_y)
 
 class MSSSIMLoss(nn.Module):
-    def __init__(self, data_range=1.0):
+    def __init__(self, data_range=1.0, channel=1):
         super().__init__()
-        self.data_range = data_range
+        # 🚀 CPU OOM FIX: Use the stateful SSIM module. 
+        # This permanently caches the kernel on the GPU instead of recreating it on the CPU every forward pass.
+        self.ssim_module = SSIM(data_range=data_range, size_average=True, channel=channel)
 
     def forward(self, pred, target):
-        min_side = min(pred.shape[-2], pred.shape[-1])
-        if min_side >= 160:
-            return 1.0 - ms_ssim(pred, target, data_range=self.data_range, size_average=True)
-        else:
-            return 1.0 - ssim(pred, target, data_range=self.data_range, size_average=True)
+        return 1.0 - self.ssim_module(pred, target)
 
 class HighFrequencyLoss(nn.Module):
     def __init__(self, kernel_size=5, sigma=1.5):
@@ -94,12 +94,11 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = get_cfg("cache.dir", "/kaggle/working/cache")
     
-    # Cap batch size safely for VRAM
     batch_size = min(int(get_cfg("train.batch_size", 32)), 32)
     epochs = int(get_cfg("train.epochs", 100))
     use_amp = bool(get_cfg("train.amp", True)) and device.type == "cuda"
 
-    print(f"--- Starting Training Run (Full Loss Stack) ---")
+    print(f"--- Starting Training Run (Full Losses, CPU-Safe) ---")
     print(f"Device: {device} | Batch Size: {batch_size} | AMP: {use_amp}")
 
     torch.manual_seed(42)
@@ -126,9 +125,11 @@ def main() -> int:
     # Initialize all losses
     charbonnier = CharbonnierLoss().to(device)
     sobel_loss = SobelEdgeLoss().to(device)
-    msssim_loss = MSSSIMLoss().to(device)
+    msssim_loss = MSSSIMLoss(channel=1).to(device)
     hf_loss = HighFrequencyLoss().to(device)
-    lpips_fn = lpips.LPIPS(net='vgg').to(device)
+    
+    # 🚀 CPU OOM FIX 2: Explicitly force LPIPS into .eval() to stop PyTorch tracking dropout/batch statistics
+    lpips_fn = lpips.LPIPS(net='vgg').to(device).eval()
     for param in lpips_fn.parameters():
         param.requires_grad = False
 
@@ -146,7 +147,6 @@ def main() -> int:
         model.train()
         total_loss = 0.0
 
-        # Detailed progress bar
         with tqdm(train_loader, desc=f"Epoch {epoch:03d}/{epochs:03d} [Train]", leave=False) as pbar:
             for batch in pbar:
                 lr = batch["lr"].to(device, non_blocking=True)
@@ -154,13 +154,11 @@ def main() -> int:
 
                 optimizer.zero_grad(set_to_none=True)
 
-                # AMP for structural geometry (safe in FP16)
                 with torch.amp.autocast('cuda', enabled=use_amp):
                     pred = model(lr)
                     l_char = charbonnier(pred, hr)
                     l_edge = sobel_loss(pred, hr)
 
-                # Force perceptual/frequency losses into FP32 to prevent NaN explosions
                 with torch.amp.autocast('cuda', enabled=False):
                     pred_f = pred.float()
                     hr_f = hr.float()
@@ -172,7 +170,6 @@ def main() -> int:
                     l_msssim = msssim_loss(pred_f, hr_f)
                     l_hf = hf_loss(pred_f, hr_f)
 
-                # Weighted sum
                 loss = (w["char"] * l_char + w["lpips"] * l_perceptual + 
                         w["edge"] * l_edge + w["msssim"] * l_msssim + w["hf"] * l_hf)
 
@@ -182,21 +179,18 @@ def main() -> int:
 
                 total_loss += loss.item()
                 
-                # Update logs with component breakdown
-                pbar.set_postfix({
-                    "Tot": f"{loss.item():.4f}",
-                    "Char": f"{(w['char']*l_char).item():.3f}",
-                    "MSSSIM": f"{(w['msssim']*l_msssim).item():.3f}",
-                    "HF": f"{(w['hf']*l_hf).item():.3f}",
-                    "LPIPS": f"{(w['lpips']*l_perceptual).item():.3f}"
-                })
+                # Format string manually to avoid holding references
+                pbar.set_postfix_str(f"Tot:{loss.item():.3f} Char:{(w['char']*l_char).item():.3f} MSSSIM:{(w['msssim']*l_msssim).item():.3f} LPIPS:{(w['lpips']*l_perceptual).item():.3f}")
+                
+                # Instantly destroy variables
+                del batch, lr, hr, pred, pred_f, hr_f, pred_norm, hr_norm
+                del l_char, l_edge, l_perceptual, l_msssim, l_hf, loss
 
         avg_train_loss = total_loss / len(train_loader)
 
         # --- Evaluation Phase ---
         model.eval()
         epoch_ssim = 0.0
-        epoch_edge_ssim = 0.0
         
         with tqdm(val_loader, desc=f"Epoch {epoch:03d}/{epochs:03d} [Eval]", leave=False) as pbar:
             with torch.no_grad():
@@ -213,25 +207,22 @@ def main() -> int:
                     
                     if isinstance(metrics, dict):
                         epoch_ssim += float(metrics["ssim"])
-                        epoch_edge_ssim += float(metrics.get("ssim_edge", 0.0))
                     else:
                         epoch_ssim += float(metrics[0])
-                        epoch_edge_ssim += float(metrics[1] if len(metrics) > 1 else 0.0)
+                        
+                    del batch, lr, hr, pred, pred_np, hr_np
 
         avg_val_ssim = epoch_ssim / len(val_loader)
-        avg_val_edge = epoch_edge_ssim / len(val_loader)
         
-        print(f"Epoch [{epoch:03d}/{epochs:03d}] | Loss: {avg_train_loss:.4f} | Val SSIM: {avg_val_ssim:.4f} | Val Edge: {avg_val_edge:.4f}")
+        print(f"Epoch [{epoch:03d}/{epochs:03d}] | Loss: {avg_train_loss:.4f} | Val SSIM: {avg_val_ssim:.4f}")
 
         if avg_val_ssim > best_ssim:
             best_ssim = avg_val_ssim
             save_path = output_dir / "best_nafnet.pt"
             unwrapped_model = model.module if hasattr(model, "module") else model
             torch.save(unwrapped_model.state_dict(), save_path)
-            print(f" -> Checkpoint saved to {save_path} (New Best SSIM!)")
+            print(f" -> Checkpoint saved to {save_path}")
 
-        # Force Memory Cleanup
-        del batch, lr, hr, pred, loss
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
