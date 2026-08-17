@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from src.config import add_config_args, load_config
 from src.splits import load_splits
@@ -16,7 +15,7 @@ from src.dataset import RestorationDataset
 from src.model import MODELS
 from src.eval_utils import stratified_ssim
 
-# --- 100% NATIVE PYTORCH LOSSES ---
+# --- NATIVE LOSSES ---
 
 class CharbonnierLoss(nn.Module):
     def __init__(self, eps=1e-3):
@@ -65,13 +64,9 @@ def main() -> int:
 
     def get_cfg(key, default=None):
         if hasattr(cfg, "get_path"):
-            try: 
-                val = cfg.get_path(key)
-                if val is not None: return val
+            try: return cfg.get_path(key)
             except: pass
-        if hasattr(cfg, "get"): 
-            val = cfg.get(key)
-            if val is not None: return val
+        if hasattr(cfg, "get"): return cfg.get(key)
         return default
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -80,16 +75,11 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = get_cfg("cache.dir", "/kaggle/working/cache")
     
-    batch_size = min(int(get_cfg("train.batch_size", 32)), 32)
-    epochs = int(get_cfg("train.epochs", 100))
-    use_amp = bool(get_cfg("train.amp", True)) and device.type == "cuda"
-    
-    # 🚀 WORKERS ARE BACK: Read from config, default to 4
-    workers = int(get_cfg("train.num_workers", 4))
-    persistent = workers > 0
+    batch_size = min(get_cfg("train.batch_size", 32), 32)
+    epochs = get_cfg("train.epochs", 100)
 
-    print(f"--- Starting Training Run (High-Speed, Leak-Proof) ---")
-    print(f"Device: {device} | Batch Size: {batch_size} | Workers: {workers} | AMP: {use_amp}")
+    print("--- Starting Minimal Training Script (Native Losses) ---")
+    print(f"Device: {device} | Batch Size: {batch_size} | Epochs: {epochs}")
 
     torch.manual_seed(42)
     sp = load_splits()
@@ -97,90 +87,75 @@ def main() -> int:
     train_ds = RestorationDataset(cache_dir, stems=sp["train"], train=True)
     val_ds = RestorationDataset(cache_dir, stems=sp["val_ood"], train=False)
 
-    # 🚀 HIGH-SPEED LOADERS: pin_memory=True, persistent_workers=True
+    # STRICT ANTI-LEAK SETTINGS from simple script
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, 
-                              num_workers=workers, pin_memory=True, persistent_workers=persistent)
+                              num_workers=0, pin_memory=False)
+    
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, 
-                            num_workers=min(workers, 1), pin_memory=True, persistent_workers=False)
+                            num_workers=0, pin_memory=False)
 
-    scale_factor = int(get_cfg("dataset.scale", 2))
+    scale_factor = get_cfg("dataset.scale", 2)
     model = MODELS["nafnet"](scale=scale_factor).to(device)
 
     if torch.cuda.device_count() > 1:
+        print(f"Wrapping model in nn.DataParallel across {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
 
-    lr_val = float(get_cfg("train.lr", 5e-4))
-    optimizer = optim.AdamW(model.parameters(), lr=lr_val, weight_decay=1e-4)
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    optimizer = optim.AdamW(model.parameters(), lr=2e-4)
 
     charbonnier = CharbonnierLoss().to(device)
     sobel_loss = SobelEdgeLoss().to(device)
     hf_loss = HighFrequencyLoss().to(device)
 
-    w_char = 1.0
-    w_edge = 0.5 
-    w_hf = 0.5
-
+    w_char, w_edge, w_hf = 1.0, 0.5, 0.5
     best_ssim = 0.0
 
     for epoch in range(1, epochs + 1):
         model.train()
-        total_loss = 0.0
+        epoch_loss = 0.0
 
-        with tqdm(train_loader, desc=f"Epoch {epoch:03d}/{epochs:03d} [Train]", leave=False) as pbar:
-            for batch in pbar:
-                lr = batch["lr"].to(device, non_blocking=True)
-                hr = batch["hr"].to(device, non_blocking=True)
+        # NO TQDM, NO AMP, NO MULTIPLE ITEMS
+        for batch in train_loader:
+            lr = batch["lr"].to(device)
+            hr = batch["hr"].to(device)
 
-                optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
+            pred = model(lr)
+            
+            l_char = charbonnier(pred, hr)
+            l_edge = sobel_loss(pred, hr)
+            l_hf = hf_loss(pred, hr)
+            
+            loss = (w_char * l_char) + (w_edge * l_edge) + (w_hf * l_hf)
+            loss.backward()
+            optimizer.step()
 
-                with torch.amp.autocast('cuda', enabled=use_amp):
-                    pred = model(lr)
-                    l_char = charbonnier(pred, hr)
-                    l_edge = sobel_loss(pred, hr)
-                    l_hf = hf_loss(pred, hr)
+            epoch_loss += loss.item()
 
-                    loss = (w_char * l_char) + (w_edge * l_edge) + (w_hf * l_hf)
-
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-
-                total_loss += loss.item()
-                
-                pbar.set_postfix_str(f"Tot:{loss.item():.3f} Char:{l_char.item():.3f} Edge:{l_edge.item():.3f} HF:{l_hf.item():.3f}")
-                
-                del batch, lr, hr, pred, l_char, l_edge, l_hf, loss
-
-        avg_train_loss = total_loss / len(train_loader)
+        avg_train_loss = epoch_loss / len(train_loader)
 
         # --- Evaluation Phase ---
         model.eval()
         epoch_ssim = 0.0
         
-        with tqdm(val_loader, desc=f"Epoch {epoch:03d}/{epochs:03d} [Eval]", leave=False) as pbar:
-            with torch.no_grad():
-                for batch in pbar:
-                    lr = batch["lr"].to(device, non_blocking=True)
-                    hr = batch["hr"].to(device, non_blocking=True)
-                    
-                    pred = torch.clamp(model(lr), 0.0, 1.0)
-                    
-                    pred_np = pred.cpu().numpy()[0, 0]
-                    hr_np = hr.cpu().numpy()[0, 0]
-                    
-                    metrics = stratified_ssim(pred_np, hr_np)
-                    
-                    if isinstance(metrics, dict):
-                        epoch_ssim += float(metrics["ssim"])
-                    else:
-                        epoch_ssim += float(metrics[0])
-                        
-                    del batch, lr, hr, pred, pred_np, hr_np
+        with torch.no_grad():
+            for batch in val_loader:
+                lr = batch["lr"].to(device)
+                hr = batch["hr"].to(device)
+                
+                pred = torch.clamp(model(lr), 0.0, 1.0)
+                
+                pred_np = pred.cpu().numpy()[0, 0]
+                hr_np = hr.cpu().numpy()[0, 0]
+                
+                metrics = stratified_ssim(pred_np, hr_np)
+                if isinstance(metrics, dict):
+                    epoch_ssim += float(metrics["ssim"])
+                else:
+                    epoch_ssim += float(metrics[0])
 
         avg_val_ssim = epoch_ssim / len(val_loader)
-        
-        print(f"Epoch [{epoch:03d}/{epochs:03d}] | Loss: {avg_train_loss:.4f} | Val SSIM: {avg_val_ssim:.4f}")
+        print(f"Epoch [{epoch:03d}/{epochs:03d}] | Train Loss: {avg_train_loss:.4f} | Val SSIM: {avg_val_ssim:.4f}")
 
         if avg_val_ssim > best_ssim:
             best_ssim = avg_val_ssim
@@ -189,6 +164,7 @@ def main() -> int:
             torch.save(unwrapped_model.state_dict(), save_path)
             print(f" -> Checkpoint saved to {save_path}")
 
+        # Clean up ONLY at the epoch boundary
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
