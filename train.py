@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from src.config import add_config_args, load_config
 from src.splits import load_splits
@@ -62,11 +63,16 @@ def main() -> int:
     args = ap.parse_args()
     cfg = load_config(args.config, args.overrides)
 
+    # Safe config getter
     def get_cfg(key, default=None):
         if hasattr(cfg, "get_path"):
-            try: return cfg.get_path(key)
+            try: 
+                val = cfg.get_path(key)
+                if val is not None: return val
             except: pass
-        if hasattr(cfg, "get"): return cfg.get(key)
+        if hasattr(cfg, "get"): 
+            val = cfg.get(key)
+            if val is not None: return val
         return default
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -75,11 +81,15 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = get_cfg("cache.dir", "/kaggle/working/cache")
     
-    batch_size = min(get_cfg("train.batch_size", 32), 32)
-    epochs = get_cfg("train.epochs", 100)
+    batch_size = min(int(get_cfg("train.batch_size", 32)), 32)
+    epochs = int(get_cfg("train.epochs", 100))
+    use_amp = bool(get_cfg("train.amp", True)) and device.type == "cuda"
+    
+    # Safely assign workers (2 is ideal for Kaggle T4x2 to avoid CPU oversubscription)
+    workers = int(get_cfg("train.num_workers", 2))
 
-    print("--- Starting Minimal Training Script (Native Losses) ---")
-    print(f"Device: {device} | Batch Size: {batch_size} | Epochs: {epochs}")
+    print("--- Starting High-Speed Training Script (Leak-Proof) ---")
+    print(f"Device: {device} | Batch Size: {batch_size} | Workers: {workers} | AMP: {use_amp}")
 
     torch.manual_seed(42)
     sp = load_splits()
@@ -87,21 +97,23 @@ def main() -> int:
     train_ds = RestorationDataset(cache_dir, stems=sp["train"], train=True)
     val_ds = RestorationDataset(cache_dir, stems=sp["val_ood"], train=False)
 
-    # STRICT ANTI-LEAK SETTINGS from simple script
+    # CRITICAL FIX 1: persistent_workers=False. This lets workers die and flushes the OS Page Cache every epoch.
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, 
-                              num_workers=0, pin_memory=False)
+                              num_workers=workers, pin_memory=True, persistent_workers=False)
     
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, 
-                            num_workers=0, pin_memory=False)
+                            num_workers=min(workers, 1), pin_memory=True, persistent_workers=False)
 
-    scale_factor = get_cfg("dataset.scale", 2)
+    scale_factor = int(get_cfg("dataset.scale", 2))
     model = MODELS["nafnet"](scale=scale_factor).to(device)
 
     if torch.cuda.device_count() > 1:
         print(f"Wrapping model in nn.DataParallel across {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
 
-    optimizer = optim.AdamW(model.parameters(), lr=2e-4)
+    lr_val = float(get_cfg("train.lr", 5e-4))
+    optimizer = optim.AdamW(model.parameters(), lr=lr_val, weight_decay=1e-4)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     charbonnier = CharbonnierLoss().to(device)
     sobel_loss = SobelEdgeLoss().to(device)
@@ -114,23 +126,31 @@ def main() -> int:
         model.train()
         epoch_loss = 0.0
 
-        # NO TQDM, NO AMP, NO MULTIPLE ITEMS
-        for batch in train_loader:
-            lr = batch["lr"].to(device)
-            hr = batch["hr"].to(device)
+        with tqdm(train_loader, desc=f"Epoch {epoch:03d}/{epochs:03d} [Train]", leave=False) as pbar:
+            for batch in pbar:
+                # non_blocking=True combined with pin_memory=True feeds the GPU instantly
+                lr = batch["lr"].to(device, non_blocking=True)
+                hr = batch["hr"].to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            pred = model(lr)
-            
-            l_char = charbonnier(pred, hr)
-            l_edge = sobel_loss(pred, hr)
-            l_hf = hf_loss(pred, hr)
-            
-            loss = (w_char * l_char) + (w_edge * l_edge) + (w_hf * l_hf)
-            loss.backward()
-            optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            epoch_loss += loss.item()
+                # AMP natively handles the PyTorch loss operations without CPU fallback
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    pred = model(lr)
+                    l_char = charbonnier(pred, hr)
+                    l_edge = sobel_loss(pred, hr)
+                    l_hf = hf_loss(pred, hr)
+                    
+                    loss = (w_char * l_char) + (w_edge * l_edge) + (w_hf * l_hf)
+                
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                # CRITICAL FIX 2: Only call .item() ONCE per batch to eliminate massive CUDA sync barriers
+                loss_val = loss.item()
+                epoch_loss += loss_val
+                pbar.set_postfix_str(f"Loss: {loss_val:.4f}")
 
         avg_train_loss = epoch_loss / len(train_loader)
 
