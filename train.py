@@ -1,4 +1,3 @@
-%%writefile /kaggle/working/kla-restoration/train.py
 #!/usr/bin/env python3
 import argparse
 import gc
