@@ -31,14 +31,24 @@ v2 fixes (diagnosed from a training run that OOM'd on Kaggle T4x2):
      longer needs `.module` unwrapping, and more importantly no longer
      pays DataParallel's per-call replicate-to-every-GPU overhead for
      727 batch-of-1 iterations that gain nothing from being split.
-  8. cudnn.benchmark is turned off for the validation pass. It's a global
-     flag and the comment in (3) above only holds for training's fixed
-     64x64 crops -- OOD validation runs full, uncropped, mixed-resolution
-     images (128->256 and 256->512 sources), so every new shape it hits
-     forces cudnn to re-run its algorithm search, which is slow and can
-     spike memory.
-  9. torch.cuda.amp.GradScaler -> torch.amp.GradScaler('cuda', ...) to
+  8. torch.cuda.amp.GradScaler -> torch.amp.GradScaler('cuda', ...) to
      drop the FutureWarning; behavior is unchanged.
+
+v3 fix (cudnn.benchmark + DataParallel threading race):
+  9. cudnn.benchmark is now off everywhere (was: on for training, off for
+     eval). Moving LPIPS/Charbonnier/Sobel inside ModelWithLoss (fix 6)
+     means DataParallel's parallel_apply now runs LPIPS concurrently on
+     BOTH GPUs' threads during training, not just on GPU0. cudnn's FIND
+     algorithm search is not safe against two threads hitting a
+     never-before-benchmarked shape at the same instant -- that's exactly
+     what "FIND was unable to find an engine to execute this computation"
+     on the very first step is. benchmark=True was never actually
+     validated against concurrent multi-GPU forward passes before (LPIPS
+     used to run single-threaded on GPU0 only); the "shape is fixed so
+     benchmark is safe" reasoning in (3) didn't account for that. Given
+     the forward pass is a small fraction of wall time here anyway (data
+     loading dominates), losing autotuning is a low-cost trade for not
+     crashing on step 1.
 
 Root cause of the actual OOM (for the record): GPU memory was flat across
 epochs in the logs, but host RSS climbed ~1GB/epoch with no plateau, and
@@ -280,12 +290,13 @@ def main() -> int:
 
     torch.manual_seed(get_cfg("train.seed", 42))
 
-    # Fixed batch shape every step (drop_last=True below) -> let cudnn
-    # autotune and reuse the fastest conv algorithms instead of picking
-    # generic ones. Big win on T4s for the strided/PixelShuffle convs.
-    # NOTE: this is training-only reasoning -- it's turned off around the
-    # validation call below, see fix (8) in the module docstring.
-    torch.backends.cudnn.benchmark = True
+    # Left off deliberately -- see fix (9) in the module docstring.
+    # DataParallel now runs LPIPS concurrently on both GPUs' threads during
+    # training (since it lives inside ModelWithLoss), and cudnn's benchmark
+    # FIND search is not thread-safe against two GPUs hitting a
+    # never-before-seen shape at the same instant -> "FIND was unable to
+    # find an engine to execute this computation" on step 1.
+    torch.backends.cudnn.benchmark = False
 
     sp = load_splits()
     cache_dir = get_cfg("cache.dir", "/kaggle/working/cache")
@@ -366,10 +377,9 @@ def main() -> int:
         # `model` is the bare NAFNet -- never wrapped in DataParallel itself
         # (see fix 7), so it evaluates directly on a single GPU with no
         # `.module` unwrapping and no per-call replicate-to-every-GPU
-        # overhead for these 727 batch-of-1 iterations.
-        torch.backends.cudnn.benchmark = False
+        # overhead for these 727 batch-of-1 iterations. cudnn.benchmark is
+        # left off (see fix 9) so no toggle is needed here any more.
         ood_ssim, ood_ssim_edge = evaluate_ood(model, val_loader, device, use_amp)
-        torch.backends.cudnn.benchmark = True
 
         epoch_time = time.time() - epoch_start
         print(f"Epoch {epoch:03d}/{epochs:03d} | Loss: {train_loss:.4f} | "
