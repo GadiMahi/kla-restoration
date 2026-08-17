@@ -15,6 +15,39 @@ T4x2 Kaggle changes (see inline comments for details):
   5. Checkpoint saving unwraps `.module` when DataParallel is active, so
      the saved state_dict loads on 1-GPU / CPU without a "module." prefix
      mismatch.
+
+v2 fixes (diagnosed from a training run that OOM'd on Kaggle T4x2):
+  6. Loss computation now happens INSIDE the DataParallel-wrapped module
+     (see ModelWithLoss) instead of after gathering every GPU's output
+     back to the default device. Previously Charbonnier/LPIPS/Sobel ran
+     only on GPU0 for the *full* batch -- LPIPS in particular is a full
+     VGG forward+backward -- which serialized most of the per-step cost
+     onto GPU0 while GPU1 sat idle after its half of the forward pass.
+     This is visible in the old logs as a persistent GPU0/GPU1 memory
+     imbalance (~6.7GB vs ~2.9GB). Now each GPU computes its own local
+     loss and only a small per-GPU scalar gets gathered.
+  7. `model` (the bare NAFNet) is never itself wrapped in DataParallel
+     any more -- only `ModelWithLoss(model, ...)` is. That means eval no
+     longer needs `.module` unwrapping, and more importantly no longer
+     pays DataParallel's per-call replicate-to-every-GPU overhead for
+     727 batch-of-1 iterations that gain nothing from being split.
+  8. cudnn.benchmark is turned off for the validation pass. It's a global
+     flag and the comment in (3) above only holds for training's fixed
+     64x64 crops -- OOD validation runs full, uncropped, mixed-resolution
+     images (128->256 and 256->512 sources), so every new shape it hits
+     forces cudnn to re-run its algorithm search, which is slow and can
+     spike memory.
+  9. torch.cuda.amp.GradScaler -> torch.amp.GradScaler('cuda', ...) to
+     drop the FutureWarning; behavior is unchanged.
+
+Root cause of the actual OOM (for the record): GPU memory was flat across
+epochs in the logs, but host RSS climbed ~1GB/epoch with no plateau, and
+the crash happened mid-epoch with no CUDA OOM traceback -- the signature
+of the Linux/Kaggle OOM killer running out of *host* RAM, not GPU memory.
+That was traced to src/dataset.py mmapping every group in index.json
+regardless of the `stems` filter (fixed separately, see dataset.py).
+Fixes 6-8 above are real efficiency/correctness fixes but are not what
+caused that specific crash.
 """
 from __future__ import annotations
 import argparse
@@ -77,6 +110,53 @@ class SobelEdgeLoss(nn.Module):
         return self.l1(pred_x, target_x) + self.l1(pred_y, target_y)
 
 
+class ModelWithLoss(nn.Module):
+    """Wraps the restoration model together with the loss functions so that,
+    under nn.DataParallel, each GPU runs its own forward pass AND computes
+    its own loss on its own local shard of the batch -- see fix (6) above.
+
+    Only a (1,)-shaped per-GPU loss tensor and pred_hr get gathered back to
+    the default device, instead of full activations/gradients for the whole
+    batch funneling through one GPU's loss computation.
+    """
+    def __init__(self, model, charbonnier, lpips_fn, sobel_loss, use_amp):
+        super().__init__()
+        self.model = model
+        self.charbonnier = charbonnier
+        self.lpips_fn = lpips_fn
+        self.sobel_loss = sobel_loss
+        self.use_amp = use_amp
+
+    def forward(self, noisy_lr, clean_hr):
+        # autocast is thread-local and DataParallel dispatches each
+        # replica's forward on its own thread via parallel_apply, so
+        # autocast must be entered *inside* forward -- entering it at the
+        # call site (outside DataParallel) would silently not apply to the
+        # replica threads. Losses stay in fp32 for stability (LPIPS-vgg can
+        # be flaky under fp16).
+        with torch.autocast(device_type="cuda", enabled=self.use_amp):
+            pred_hr = self.model(noisy_lr)
+        pred_hr = pred_hr.float()
+
+        # 1. Pixel Fidelity Loss (Primary driver for contrast and exact intensities)
+        l_char = self.charbonnier(pred_hr, clean_hr)
+
+        # 2. Perceptual Loss (Scaled down to 0.05 so it doesn't destroy pixel contrast)
+        pred_norm = pred_hr * 2.0 - 1.0
+        clean_norm = clean_hr * 2.0 - 1.0
+        l_perceptual = self.lpips_fn(pred_norm, clean_norm).mean()
+
+        # 3. Structural Edge Loss
+        l_edge = self.sobel_loss(pred_hr, clean_hr)
+
+        # Balanced Loss Combination
+        loss = (1.0 * l_char) + (0.05 * l_perceptual) + (0.5 * l_edge)
+
+        # unsqueeze so DataParallel concatenates per-GPU scalars along dim 0
+        # correctly regardless of device count; caller takes .mean().
+        return loss.unsqueeze(0), pred_hr
+
+
 # --- Memory logging helpers ---
 
 def _gb(num_bytes: float) -> float:
@@ -109,11 +189,10 @@ def log_memory(tag: str = "", printer=print):
 
 # --- Core Loop ---
 
-def train_one_epoch(model, dataloader, optimizer, loss_fns, device,
-                     epoch, use_amp, scaler, log_interval):
-    model.train()
+def train_one_epoch(train_module, dataloader, optimizer, device,
+                     epoch, scaler, log_interval):
+    train_module.train()
     total_loss = 0.0
-    charbonnier, lpips_fn, sobel_loss = loss_fns
 
     pbar = tqdm(dataloader, desc="Training", leave=False)
     for step, batch in enumerate(pbar):
@@ -126,25 +205,8 @@ def train_one_epoch(model, dataloader, optimizer, loss_fns, device,
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Only the NAFNet forward pass runs under autocast -- it's the
-        # dominant cost. Losses (esp. LPIPS-vgg) are computed in fp32.
-        with torch.autocast(device_type="cuda", enabled=use_amp):
-            pred_hr = model(noisy_lr)
-        pred_hr = pred_hr.float()
-
-        # 1. Pixel Fidelity Loss (Primary driver for contrast and exact intensities)
-        l_char = charbonnier(pred_hr, clean_hr)
-
-        # 2. Perceptual Loss (Scaled down to 0.05 so it doesn't destroy pixel contrast)
-        pred_norm = pred_hr * 2.0 - 1.0
-        clean_norm = clean_hr * 2.0 - 1.0
-        l_perceptual = lpips_fn(pred_norm, clean_norm).mean()
-
-        # 3. Structural Edge Loss
-        l_edge = sobel_loss(pred_hr, clean_hr)
-
-        # Balanced Loss Combination
-        loss = (1.0 * l_char) + (0.05 * l_perceptual) + (0.5 * l_edge)
+        per_gpu_loss, pred_hr = train_module(noisy_lr, clean_hr)
+        loss = per_gpu_loss.mean()
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -221,6 +283,8 @@ def main() -> int:
     # Fixed batch shape every step (drop_last=True below) -> let cudnn
     # autotune and reuse the fastest conv algorithms instead of picking
     # generic ones. Big win on T4s for the strided/PixelShuffle convs.
+    # NOTE: this is training-only reasoning -- it's turned off around the
+    # validation call below, see fix (8) in the module docstring.
     torch.backends.cudnn.benchmark = True
 
     sp = load_splits()
@@ -240,7 +304,11 @@ def main() -> int:
     val_loader = DataLoader(
         val_ood_ds, batch_size=1, shuffle=False,
         num_workers=workers, pin_memory=True,
-        persistent_workers=workers > 0,
+        # Validation only runs once per epoch, so the per-epoch worker
+        # respawn cost is trivial -- persistent_workers=False here gives
+        # each epoch's eval workers a clean slate instead of accumulating
+        # state for the entire 100-epoch run.
+        persistent_workers=False,
     )
 
     scale_factor = get_cfg("dataset.scale", 2)
@@ -248,10 +316,6 @@ def main() -> int:
 
     n_gpus = torch.cuda.device_count()
     multi_gpu = n_gpus > 1 and device.type == "cuda"
-    if multi_gpu:
-        print(f"--- Detected {n_gpus} GPUs -> wrapping model in nn.DataParallel "
-              f"(effective per-GPU batch ~= {batch_size // n_gpus}) ---")
-        model = nn.DataParallel(model, device_ids=list(range(n_gpus)))
 
     if torch.cuda.is_available():
         for i in range(n_gpus):
@@ -259,11 +323,14 @@ def main() -> int:
             print(f"    GPU{i}: {props.name}, {_gb(props.total_memory):.1f}GB total")
 
     use_amp = bool(get_cfg("train.amp", True)) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     log_interval = int(get_cfg("train.log_interval", 50))
     print(f"--- Mixed precision (AMP): {use_amp} | memory log every {log_interval} steps ---")
 
     epochs = get_cfg("train.epochs", 100)
+    # Optimizer sees only the bare NAFNet's parameters, same as before --
+    # `model` is never itself wrapped in DataParallel now (only
+    # ModelWithLoss(model, ...) is), so model.parameters() is unaffected.
     optimizer = optim.AdamW(model.parameters(), lr=get_cfg("train.lr", 5e-4), weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
@@ -273,7 +340,18 @@ def main() -> int:
     for param in lpips_fn.parameters():
         param.requires_grad = False
 
-    loss_fns = (charbonnier, lpips_fn, sobel_loss)
+    # See fix (6): wrap model+losses together so DataParallel splits the
+    # *whole* per-step workload -- forward AND loss -- across both GPUs,
+    # instead of gathering every GPU's output onto GPU0 and running
+    # Charbonnier/LPIPS/Sobel there alone for the full batch.
+    train_module = ModelWithLoss(model, charbonnier, lpips_fn, sobel_loss, use_amp)
+    if multi_gpu:
+        print(f"--- Detected {n_gpus} GPUs -> wrapping model+loss in nn.DataParallel "
+              f"(effective per-GPU batch ~= {batch_size // n_gpus}) ---")
+        train_module = nn.DataParallel(train_module, device_ids=list(range(n_gpus)))
+    else:
+        train_module = train_module.to(device)
+
     best_ood_ssim = 0.0
 
     print(f"--- Starting Training Run (High-Capacity U-Net NAFNet) for {epochs} epochs on {device} ---")
@@ -281,11 +359,17 @@ def main() -> int:
         reset_peak_memory_stats()
         epoch_start = time.time()
 
-        train_loss = train_one_epoch(model, train_loader, optimizer, loss_fns, device,
-                                      epoch, use_amp, scaler, log_interval)
+        train_loss = train_one_epoch(train_module, train_loader, optimizer, device,
+                                      epoch, scaler, log_interval)
         scheduler.step()
 
+        # `model` is the bare NAFNet -- never wrapped in DataParallel itself
+        # (see fix 7), so it evaluates directly on a single GPU with no
+        # `.module` unwrapping and no per-call replicate-to-every-GPU
+        # overhead for these 727 batch-of-1 iterations.
+        torch.backends.cudnn.benchmark = False
         ood_ssim, ood_ssim_edge = evaluate_ood(model, val_loader, device, use_amp)
+        torch.backends.cudnn.benchmark = True
 
         epoch_time = time.time() - epoch_start
         print(f"Epoch {epoch:03d}/{epochs:03d} | Loss: {train_loss:.4f} | "
@@ -296,8 +380,10 @@ def main() -> int:
         if ood_ssim > best_ood_ssim:
             best_ood_ssim = ood_ssim
             save_path = output_dir / "best_nafnet.pt"
-            state_dict = model.module.state_dict() if multi_gpu else model.state_dict()
-            torch.save(state_dict, save_path)
+            # model is always the unwrapped NAFNet now, so state_dict()
+            # loads on 1-GPU / CPU with no "module." prefix mismatch --
+            # no conditional unwrap needed any more.
+            torch.save(model.state_dict(), save_path)
             print(f" -> Checkpoint saved to {save_path}")
 
     return 0
