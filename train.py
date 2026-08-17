@@ -1,3 +1,4 @@
+%%writefile /kaggle/working/kla-restoration/train.py
 #!/usr/bin/env python3
 import argparse
 import gc
@@ -16,7 +17,7 @@ from src.dataset import RestorationDataset
 from src.model import MODELS
 from src.eval_utils import stratified_ssim
 
-# --- 100% NATIVE PYTORCH LOSSES (NO LEAKS, NO CPU SYNCS) ---
+# --- 100% NATIVE PYTORCH LOSSES ---
 
 class CharbonnierLoss(nn.Module):
     def __init__(self, eps=1e-3):
@@ -28,7 +29,6 @@ class CharbonnierLoss(nn.Module):
 class SobelEdgeLoss(nn.Module):
     def __init__(self):
         super().__init__()
-        # Native convolution kernels for edge detection
         kernel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).view(1, 1, 3, 3)
         kernel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]).view(1, 1, 3, 3)
         self.register_buffer('weight_x', kernel_x)
@@ -45,7 +45,6 @@ class SobelEdgeLoss(nn.Module):
 class HighFrequencyLoss(nn.Module):
     def __init__(self, kernel_size=5, sigma=1.5):
         super().__init__()
-        # Native convolution kernel for texture isolation
         coords = torch.arange(kernel_size).float() - kernel_size // 2
         g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
         g = g / g.sum()
@@ -57,7 +56,6 @@ class HighFrequencyLoss(nn.Module):
     def forward(self, pred, target):
         pred_blur = F.conv2d(pred, self.kernel, padding=self.pad)
         target_blur = F.conv2d(target, self.kernel, padding=self.pad)
-        # Penalize differences in high-frequency details directly
         return self.l1(pred - pred_blur, target - target_blur)
 
 
@@ -83,13 +81,16 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = get_cfg("cache.dir", "/kaggle/working/cache")
     
-    # Keeping batch size at 32 for stability
     batch_size = min(int(get_cfg("train.batch_size", 32)), 32)
     epochs = int(get_cfg("train.epochs", 100))
     use_amp = bool(get_cfg("train.amp", True)) and device.type == "cuda"
+    
+    # 🚀 WORKERS ARE BACK: Read from config, default to 4
+    workers = int(get_cfg("train.num_workers", 4))
+    persistent = workers > 0
 
-    print(f"--- Starting Training Run (Pure Native Losses, Leak-Proof) ---")
-    print(f"Device: {device} | Batch Size: {batch_size} | AMP: {use_amp}")
+    print(f"--- Starting Training Run (High-Speed, Leak-Proof) ---")
+    print(f"Device: {device} | Batch Size: {batch_size} | Workers: {workers} | AMP: {use_amp}")
 
     torch.manual_seed(42)
     sp = load_splits()
@@ -97,10 +98,11 @@ def main() -> int:
     train_ds = RestorationDataset(cache_dir, stems=sp["train"], train=True)
     val_ds = RestorationDataset(cache_dir, stems=sp["val_ood"], train=False)
 
+    # 🚀 HIGH-SPEED LOADERS: pin_memory=True, persistent_workers=True
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, 
-                              num_workers=0, pin_memory=False)
+                              num_workers=workers, pin_memory=True, persistent_workers=persistent)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, 
-                            num_workers=0, pin_memory=False)
+                            num_workers=min(workers, 1), pin_memory=True, persistent_workers=False)
 
     scale_factor = int(get_cfg("dataset.scale", 2))
     model = MODELS["nafnet"](scale=scale_factor).to(device)
@@ -112,12 +114,10 @@ def main() -> int:
     optimizer = optim.AdamW(model.parameters(), lr=lr_val, weight_decay=1e-4)
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
-    # Initialize Native Losses
     charbonnier = CharbonnierLoss().to(device)
     sobel_loss = SobelEdgeLoss().to(device)
     hf_loss = HighFrequencyLoss().to(device)
 
-    # Rebalanced weights since we removed MSSSIM and LPIPS
     w_char = 1.0
     w_edge = 0.5 
     w_hf = 0.5
@@ -135,7 +135,6 @@ def main() -> int:
 
                 optimizer.zero_grad(set_to_none=True)
 
-                # AMP natively handles these PyTorch operations safely
                 with torch.amp.autocast('cuda', enabled=use_amp):
                     pred = model(lr)
                     l_char = charbonnier(pred, hr)
@@ -150,10 +149,8 @@ def main() -> int:
 
                 total_loss += loss.item()
                 
-                # Update progress bar
                 pbar.set_postfix_str(f"Tot:{loss.item():.3f} Char:{l_char.item():.3f} Edge:{l_edge.item():.3f} HF:{l_hf.item():.3f}")
                 
-                # Brutal memory cleanup
                 del batch, lr, hr, pred, l_char, l_edge, l_hf, loss
 
         avg_train_loss = total_loss / len(train_loader)
@@ -165,8 +162,8 @@ def main() -> int:
         with tqdm(val_loader, desc=f"Epoch {epoch:03d}/{epochs:03d} [Eval]", leave=False) as pbar:
             with torch.no_grad():
                 for batch in pbar:
-                    lr = batch["lr"].to(device)
-                    hr = batch["hr"].to(device)
+                    lr = batch["lr"].to(device, non_blocking=True)
+                    hr = batch["hr"].to(device, non_blocking=True)
                     
                     pred = torch.clamp(model(lr), 0.0, 1.0)
                     
