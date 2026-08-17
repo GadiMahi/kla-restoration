@@ -79,9 +79,13 @@ def main() -> int:
 
     def get_cfg(key, default=None):
         if hasattr(cfg, "get_path"):
-            try: return cfg.get_path(key)
+            try: 
+                val = cfg.get_path(key)
+                if val is not None: return val
             except: pass
-        if hasattr(cfg, "get"): return cfg.get(key)
+        if hasattr(cfg, "get"): 
+            val = cfg.get(key)
+            if val is not None: return val
         return default
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -91,8 +95,8 @@ def main() -> int:
     cache_dir = get_cfg("cache.dir", "/kaggle/working/cache")
     
     # Cap batch size safely for VRAM
-    batch_size = min(get_cfg("train.batch_size", 32), 32)
-    epochs = get_cfg("train.epochs", 100)
+    batch_size = min(int(get_cfg("train.batch_size", 32)), 32)
+    epochs = int(get_cfg("train.epochs", 100))
     use_amp = bool(get_cfg("train.amp", True)) and device.type == "cuda"
 
     print(f"--- Starting Training Run (Full Loss Stack) ---")
@@ -109,13 +113,14 @@ def main() -> int:
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, 
                             num_workers=0, pin_memory=False)
 
-    scale_factor = get_cfg("dataset.scale", 2)
+    scale_factor = int(get_cfg("dataset.scale", 2))
     model = MODELS["nafnet"](scale=scale_factor).to(device)
 
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
-    optimizer = optim.AdamW(model.parameters(), lr=get_cfg("train.lr", 5e-4), weight_decay=1e-4)
+    lr_val = float(get_cfg("train.lr", 5e-4))
+    optimizer = optim.AdamW(model.parameters(), lr=lr_val, weight_decay=1e-4)
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     # Initialize all losses
