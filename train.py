@@ -60,7 +60,6 @@ class CharbonnierLoss(nn.Module):
     def forward(self, pred, target):
         return torch.mean(torch.sqrt((pred - target)**2 + self.eps**2))
 
-
 class SobelEdgeLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -207,14 +206,11 @@ def main() -> int:
         if hasattr(cfg, "get_path"):
             try:
                 val = cfg.get_path(key)
-                if val is not None:
-                    return val
-            except Exception:
-                pass
+                if val is not None: return val
+            except Exception: pass
         if hasattr(cfg, "get"):
             val = cfg.get(key)
-            if val is not None:
-                return val
+            if val is not None: return val
         return default
 
     output_dir = Path(get_cfg("output.dir", "/kaggle/working/kla-restoration/artifacts"))
@@ -241,8 +237,6 @@ def main() -> int:
         num_workers=workers, pin_memory=True, drop_last=True,
         persistent_workers=workers > 0,
     )
-
-    val_workers = min(workers, 1)
     val_loader = DataLoader(
         val_ood_ds, batch_size=1, shuffle=False,
         num_workers=workers, pin_memory=True,
@@ -275,8 +269,6 @@ def main() -> int:
 
     charbonnier = CharbonnierLoss().to(device)
     sobel_loss = SobelEdgeLoss().to(device)
-    msssim_loss = MSSSIMLoss().to(device)
-    hf_loss = HighFrequencyLoss().to(device)
     lpips_fn = lpips.LPIPS(net='vgg').to(device)
     for param in lpips_fn.parameters():
         param.requires_grad = False
@@ -307,11 +299,6 @@ def main() -> int:
             state_dict = model.module.state_dict() if multi_gpu else model.state_dict()
             torch.save(state_dict, save_path)
             print(f" -> Checkpoint saved to {save_path}")
-
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        log_mem(f"after epoch {epoch:03d}")
 
     return 0
 
