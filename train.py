@@ -9,10 +9,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import lpips
-
-# Use the stateful modules, NOT the functional calls!
-from pytorch_msssim import SSIM, MS_SSIM
 
 from src.config import add_config_args, load_config
 from src.splits import load_splits
@@ -20,7 +16,7 @@ from src.dataset import RestorationDataset
 from src.model import MODELS
 from src.eval_utils import stratified_ssim
 
-# --- Memory-Safe PyTorch Losses ---
+# --- 100% NATIVE PYTORCH LOSSES (NO LEAKS, NO CPU SYNCS) ---
 
 class CharbonnierLoss(nn.Module):
     def __init__(self, eps=1e-3):
@@ -32,6 +28,7 @@ class CharbonnierLoss(nn.Module):
 class SobelEdgeLoss(nn.Module):
     def __init__(self):
         super().__init__()
+        # Native convolution kernels for edge detection
         kernel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]).view(1, 1, 3, 3)
         kernel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]).view(1, 1, 3, 3)
         self.register_buffer('weight_x', kernel_x)
@@ -45,19 +42,10 @@ class SobelEdgeLoss(nn.Module):
         target_y = F.conv2d(target, self.weight_y, padding=1)
         return self.l1(pred_x, target_x) + self.l1(pred_y, target_y)
 
-class MSSSIMLoss(nn.Module):
-    def __init__(self, data_range=1.0, channel=1):
-        super().__init__()
-        # 🚀 CPU OOM FIX: Use the stateful SSIM module. 
-        # This permanently caches the kernel on the GPU instead of recreating it on the CPU every forward pass.
-        self.ssim_module = SSIM(data_range=data_range, size_average=True, channel=channel)
-
-    def forward(self, pred, target):
-        return 1.0 - self.ssim_module(pred, target)
-
 class HighFrequencyLoss(nn.Module):
     def __init__(self, kernel_size=5, sigma=1.5):
         super().__init__()
+        # Native convolution kernel for texture isolation
         coords = torch.arange(kernel_size).float() - kernel_size // 2
         g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
         g = g / g.sum()
@@ -69,6 +57,7 @@ class HighFrequencyLoss(nn.Module):
     def forward(self, pred, target):
         pred_blur = F.conv2d(pred, self.kernel, padding=self.pad)
         target_blur = F.conv2d(target, self.kernel, padding=self.pad)
+        # Penalize differences in high-frequency details directly
         return self.l1(pred - pred_blur, target - target_blur)
 
 
@@ -94,11 +83,12 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = get_cfg("cache.dir", "/kaggle/working/cache")
     
+    # Keeping batch size at 32 for stability
     batch_size = min(int(get_cfg("train.batch_size", 32)), 32)
     epochs = int(get_cfg("train.epochs", 100))
     use_amp = bool(get_cfg("train.amp", True)) and device.type == "cuda"
 
-    print(f"--- Starting Training Run (Full Losses, CPU-Safe) ---")
+    print(f"--- Starting Training Run (Pure Native Losses, Leak-Proof) ---")
     print(f"Device: {device} | Batch Size: {batch_size} | AMP: {use_amp}")
 
     torch.manual_seed(42)
@@ -122,24 +112,15 @@ def main() -> int:
     optimizer = optim.AdamW(model.parameters(), lr=lr_val, weight_decay=1e-4)
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
-    # Initialize all losses
+    # Initialize Native Losses
     charbonnier = CharbonnierLoss().to(device)
     sobel_loss = SobelEdgeLoss().to(device)
-    msssim_loss = MSSSIMLoss(channel=1).to(device)
     hf_loss = HighFrequencyLoss().to(device)
-    
-    # 🚀 CPU OOM FIX 2: Explicitly force LPIPS into .eval() to stop PyTorch tracking dropout/batch statistics
-    lpips_fn = lpips.LPIPS(net='vgg').to(device).eval()
-    for param in lpips_fn.parameters():
-        param.requires_grad = False
 
-    w = {
-        "char":   float(get_cfg("train.loss.char_w", 1.0)),
-        "lpips":  float(get_cfg("train.loss.lpips_w", 0.05)),
-        "edge":   float(get_cfg("train.loss.edge_w", 0.2)),
-        "msssim": float(get_cfg("train.loss.msssim_w", 0.3)),
-        "hf":     float(get_cfg("train.loss.hf_w", 0.4)),
-    }
+    # Rebalanced weights since we removed MSSSIM and LPIPS
+    w_char = 1.0
+    w_edge = 0.5 
+    w_hf = 0.5
 
     best_ssim = 0.0
 
@@ -154,24 +135,14 @@ def main() -> int:
 
                 optimizer.zero_grad(set_to_none=True)
 
+                # AMP natively handles these PyTorch operations safely
                 with torch.amp.autocast('cuda', enabled=use_amp):
                     pred = model(lr)
                     l_char = charbonnier(pred, hr)
                     l_edge = sobel_loss(pred, hr)
+                    l_hf = hf_loss(pred, hr)
 
-                with torch.amp.autocast('cuda', enabled=False):
-                    pred_f = pred.float()
-                    hr_f = hr.float()
-                    
-                    pred_norm = pred_f * 2.0 - 1.0
-                    hr_norm = hr_f * 2.0 - 1.0
-                    
-                    l_perceptual = lpips_fn(pred_norm, hr_norm).mean()
-                    l_msssim = msssim_loss(pred_f, hr_f)
-                    l_hf = hf_loss(pred_f, hr_f)
-
-                loss = (w["char"] * l_char + w["lpips"] * l_perceptual + 
-                        w["edge"] * l_edge + w["msssim"] * l_msssim + w["hf"] * l_hf)
+                    loss = (w_char * l_char) + (w_edge * l_edge) + (w_hf * l_hf)
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -179,12 +150,11 @@ def main() -> int:
 
                 total_loss += loss.item()
                 
-                # Format string manually to avoid holding references
-                pbar.set_postfix_str(f"Tot:{loss.item():.3f} Char:{(w['char']*l_char).item():.3f} MSSSIM:{(w['msssim']*l_msssim).item():.3f} LPIPS:{(w['lpips']*l_perceptual).item():.3f}")
+                # Update progress bar
+                pbar.set_postfix_str(f"Tot:{loss.item():.3f} Char:{l_char.item():.3f} Edge:{l_edge.item():.3f} HF:{l_hf.item():.3f}")
                 
-                # Instantly destroy variables
-                del batch, lr, hr, pred, pred_f, hr_f, pred_norm, hr_norm
-                del l_char, l_edge, l_perceptual, l_msssim, l_hf, loss
+                # Brutal memory cleanup
+                del batch, lr, hr, pred, l_char, l_edge, l_hf, loss
 
         avg_train_loss = total_loss / len(train_loader)
 
