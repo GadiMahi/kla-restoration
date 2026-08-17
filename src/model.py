@@ -201,7 +201,3 @@ def _nafnet(scale=2, **kwargs):
 @register("bicubic")
 def _bicubic(scale: int = 2, **_) -> nn.Module:
     return BicubicUpsample(scale)
-
-
-
-

@@ -64,8 +64,12 @@ def main() -> int:
     ap = add_config_args(argparse.ArgumentParser(description=__doc__))
     ap.add_argument("--input_dir", required=True)
     ap.add_argument("--output_dir", required=True)
-    ap.add_argument("--weights", default=None)
-    ap.add_argument("--model", default=None)
+    
+    # Updated Defaults: Automatically load the nafnet model and the pushed LFS weights
+    default_weights_path = str(Path(__file__).resolve().parent / "weights" / "best_nafnet.pt")
+    ap.add_argument("--weights", default=default_weights_path)
+    ap.add_argument("--model", default="nafnet")
+    
     ap.add_argument("--batch_size", type=int, default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--timing_json", default=None)
@@ -90,11 +94,15 @@ def main() -> int:
     gf = stats.get("gt_format")
     fmt = ImageFormat.from_dict(gf) if gf else detect_format(files[0])
 
-    model = build_model(args.model or cfg.get_path("inference.model", "bicubic"),
-                        scale=cfg.get_path("dataset.scale", 2)).to(device).eval()
-    if args.weights:
+    # Instantiate model
+    model = build_model(args.model, scale=cfg.get_path("dataset.scale", 2)).to(device).eval()
+    
+    if args.weights and Path(args.weights).exists():
+        print(f"Loading weights from: {args.weights}")
         sd = torch.load(args.weights, map_location=device)
         model.load_state_dict(sd.get("model", sd))
+    else:
+        print(f"WARNING: Weights file not found at {args.weights}. Running with uninitialized weights!")
 
     sw = Stopwatch()
     pool = ThreadPoolExecutor(max_workers=8)
