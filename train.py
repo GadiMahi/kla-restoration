@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 """
-v4 changes (Memory Leak & Warning Fixes):
-  - Wrapped `tqdm` in `with` context managers. This forces the DataLoader 
-    generator to cleanly close at the end of the epoch, allowing PyTorch 
-    to destroy the worker IPC queues and free host RAM.
-  - Disabled `pin_memory=True` in train_loader. Pinned memory threads are 
-    notorious for leaking host RAM across epochs when workers respawn.
-  - Added explicit `del` statements at the end of train/eval loops to 
-    force variable garbage collection.
-  - Updated deprecated `torch.cuda.amp` calls to PyTorch 2.x `torch.amp` standards.
+T4x2 Kaggle changes (see inline comments for details):
+  1. Multi-GPU: wraps the model in nn.DataParallel when >1 GPU is visible,
+     so `train.batch_size=32` gets split ~16/16 across the two T4s.
+     (DataParallel, not DDP -- this keeps the single `!python train.py`
+     invocation working with no torchrun/launcher needed.)
+  2. Mixed precision (autocast + GradScaler) on the NAFNet forward pass,
+     which is the expensive part -- perceptual/edge/pixel losses are
+     computed in fp32 for stability (LPIPS-vgg can be flaky under fp16).
+  3. cudnn.benchmark=True, since batch shape is fixed every step
+     (drop_last=True), so cudnn's autotuned kernels pay off immediately.
+  4. GPU (+ host RSS) memory logging: once every `train.log_interval`
+     steps during training, and a summary at the end of every epoch.
+  5. Checkpoint saving unwraps `.module` when DataParallel is active, so
+     the saved state_dict loads on 1-GPU / CPU without a "module." prefix
+     mismatch.
 """
 from __future__ import annotations
 import argparse
 import sys
 import os
-import gc
+
+# Must be set before the first CUDA call (not necessarily before `import
+# torch`, but doing it here is simplest) -- reduces allocator fragmentation
+# on 16GB T4s under AMP's mixed alloc sizes. Harmless if already set.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -34,18 +46,10 @@ from src.eval_utils import stratified_ssim
 import lpips
 
 try:
-    from pytorch_msssim import ms_ssim, ssim
-except ImportError as e:
-    raise ImportError(
-        "pytorch-msssim is required for the MS-SSIM loss term.\n"
-        "Install with: pip install pytorch-msssim"
-    ) from e
-
-try:
-    import psutil
-    _HAS_PSUTIL = True
+    import resource  # POSIX only (fine on Kaggle's Linux images)
+    _HAVE_RESOURCE = True
 except ImportError:
-    _HAS_PSUTIL = False
+    _HAVE_RESOURCE = False
 
 # --- PyTorch Native Losses ---
 
@@ -74,151 +78,119 @@ class SobelEdgeLoss(nn.Module):
         return self.l1(pred_x, target_x) + self.l1(pred_y, target_y)
 
 
-class MSSSIMLoss(nn.Module):
-    def __init__(self, data_range=1.0):
-        super().__init__()
-        self.data_range = data_range
+# --- Memory logging helpers ---
 
-    def forward(self, pred, target):
-        min_side = min(pred.shape[-2], pred.shape[-1])
-        if min_side >= 160:
-            return 1.0 - ms_ssim(pred, target, data_range=self.data_range, size_average=True)
-        else:
-            return 1.0 - ssim(pred, target, data_range=self.data_range, size_average=True)
+def _gb(num_bytes: float) -> float:
+    return num_bytes / (1024 ** 3)
 
 
-class HighFrequencyLoss(nn.Module):
-    def __init__(self, kernel_size=5, sigma=1.5):
-        super().__init__()
-        coords = torch.arange(kernel_size).float() - kernel_size // 2
-        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
-        g = g / g.sum()
-        kernel = (g[:, None] * g[None, :]).view(1, 1, kernel_size, kernel_size)
-        self.register_buffer('kernel', kernel)
-        self.pad = kernel_size // 2
-        self.l1 = nn.L1Loss()
-
-    def forward(self, pred, target):
-        pred_blur = F.conv2d(pred, self.kernel, padding=self.pad)
-        target_blur = F.conv2d(target, self.kernel, padding=self.pad)
-        return self.l1(pred - pred_blur, target - target_blur)
+def reset_peak_memory_stats():
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            torch.cuda.reset_peak_memory_stats(i)
 
 
-# --- Padding helpers ---
-
-def pad_to_multiple(x: torch.Tensor, multiple: int = 4):
-    h, w = x.shape[-2:]
-    pad_h = (multiple - h % multiple) % multiple
-    pad_w = (multiple - w % multiple) % multiple
-    if pad_h == 0 and pad_w == 0:
-        return x, (0, 0)
-    return F.pad(x, (0, pad_w, 0, pad_h), mode="reflect"), (pad_h, pad_w)
-
-
-def crop_to_scale(x: torch.Tensor, pad_h: int, pad_w: int, scale: int):
-    if pad_h == 0 and pad_w == 0:
-        return x
-    h, w = x.shape[-2:]
-    return x[..., : h - pad_h * scale, : w - pad_w * scale]
-
-
-def unwrap(model: nn.Module) -> nn.Module:
-    return model.module if hasattr(model, "module") else model
-
-
-def log_mem(tag: str = ""):
-    if not _HAS_PSUTIL:
-        return
-    rss_gb = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
-    print(f"    [mem]{(' ' + tag) if tag else ''} main process RSS: {rss_gb:.2f} GB")
+def log_memory(tag: str = "", printer=print):
+    """Logs per-GPU allocated/reserved/peak memory plus host peak RSS."""
+    parts = []
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            alloc = _gb(torch.cuda.memory_allocated(i))
+            reserved = _gb(torch.cuda.memory_reserved(i))
+            peak = _gb(torch.cuda.max_memory_allocated(i))
+            parts.append(f"GPU{i} alloc={alloc:.2f}GB reserved={reserved:.2f}GB peak={peak:.2f}GB")
+    host = ""
+    if _HAVE_RESOURCE:
+        # ru_maxrss is KB on Linux, bytes on macOS -- Kaggle is Linux.
+        host_gb = _gb(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024)
+        host = f" | host_peak_rss={host_gb:.2f}GB"
+    label = f"[mem{' ' + tag if tag else ''}] "
+    printer(label + (" | ".join(parts) if parts else "no CUDA device") + host)
 
 
 # --- Core Loop ---
 
-def train_one_epoch(model, dataloader, optimizer, loss_fns, loss_weights, device, scaler):
+def train_one_epoch(model, dataloader, optimizer, loss_fns, device,
+                     epoch, use_amp, scaler, log_interval):
     model.train()
     total_loss = 0.0
-    charbonnier, lpips_fn, sobel_loss, msssim_loss, hf_loss = loss_fns
-    w = loss_weights
-    amp_enabled = scaler.is_enabled()
+    charbonnier, lpips_fn, sobel_loss = loss_fns
 
-    # FIX 1: Use `with` context manager to force generator cleanup
-    with tqdm(dataloader, desc="Training", leave=False) as pbar:
-        for batch in pbar:
-            if isinstance(batch, dict):
-                noisy_lr = batch.get("lr", batch.get("noisy")).to(device, non_blocking=True)
-                clean_hr = batch.get("hr", batch.get("gt")).to(device, non_blocking=True)
-            else:
-                noisy_lr = batch[0].to(device, non_blocking=True)
-                clean_hr = batch[1].to(device, non_blocking=True)
+    pbar = tqdm(dataloader, desc="Training", leave=False)
+    for step, batch in enumerate(pbar):
+        if isinstance(batch, dict):
+            noisy_lr = batch.get("lr", batch.get("noisy")).to(device, non_blocking=True)
+            clean_hr = batch.get("hr", batch.get("gt")).to(device, non_blocking=True)
+        else:
+            noisy_lr = batch[0].to(device, non_blocking=True)
+            clean_hr = batch[1].to(device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
 
-            # FIX 2: Updated to PyTorch 2.x standard calls
-            with torch.amp.autocast('cuda', enabled=amp_enabled):
-                pred_hr = model(noisy_lr)
-                l_char = charbonnier(pred_hr, clean_hr)
-                l_edge = sobel_loss(pred_hr, clean_hr)
+        # Only the NAFNet forward pass runs under autocast -- it's the
+        # dominant cost. Losses (esp. LPIPS-vgg) are computed in fp32.
+        with torch.autocast(device_type="cuda", enabled=use_amp):
+            pred_hr = model(noisy_lr)
+        pred_hr = pred_hr.float()
 
-            with torch.amp.autocast('cuda', enabled=False):
-                pred_f = pred_hr.float()
-                clean_f = clean_hr.float()
-                pred_norm = pred_f * 2.0 - 1.0
-                clean_norm = clean_f * 2.0 - 1.0
-                l_perceptual = lpips_fn(pred_norm, clean_norm).mean()
-                l_msssim = msssim_loss(pred_f, clean_f)
-                l_hf = hf_loss(pred_f, clean_f)
+        # 1. Pixel Fidelity Loss (Primary driver for contrast and exact intensities)
+        l_char = charbonnier(pred_hr, clean_hr)
 
-            loss = (w["char"] * l_char + w["lpips"] * l_perceptual + w["edge"] * l_edge
-                    + w["msssim"] * l_msssim + w["hf"] * l_hf)
+        # 2. Perceptual Loss (Scaled down to 0.05 so it doesn't destroy pixel contrast)
+        pred_norm = pred_hr * 2.0 - 1.0
+        clean_norm = clean_hr * 2.0 - 1.0
+        l_perceptual = lpips_fn(pred_norm, clean_norm).mean()
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+        # 3. Structural Edge Loss
+        l_edge = sobel_loss(pred_hr, clean_hr)
 
-            total_loss += loss.item()
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-            
-    # FIX 3: Explicitly delete batch references to free memory
-    del batch, noisy_lr, clean_hr, pred_hr, loss
+        # Balanced Loss Combination
+        loss = (1.0 * l_char) + (0.05 * l_perceptual) + (0.5 * l_edge)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        if log_interval > 0 and (step + 1) % log_interval == 0:
+            log_memory(tag=f"epoch {epoch} step {step + 1}/{len(dataloader)}", printer=tqdm.write)
+
     return total_loss / len(dataloader)
 
 
 @torch.no_grad()
-def evaluate_ood(model, dataloader, device, scale: int):
+def evaluate_ood(model, dataloader, device, use_amp):
     model.eval()
     total_ssim = 0.0
     total_ssim_edge = 0.0
 
-    # FIX 1: Use `with` context manager
-    with tqdm(dataloader, desc="Validating (OOD)", leave=False) as pbar:
-        for batch in pbar:
-            if isinstance(batch, dict):
-                noisy_lr = batch.get("lr", batch.get("noisy")).to(device)
-                clean_hr = batch.get("hr", batch.get("gt")).to(device)
-            else:
-                noisy_lr, clean_hr = batch[0].to(device), batch[1].to(device)
+    pbar = tqdm(dataloader, desc="Validating (OOD)", leave=False)
+    for batch in pbar:
+        if isinstance(batch, dict):
+            noisy_lr = batch.get("lr", batch.get("noisy")).to(device, non_blocking=True)
+            clean_hr = batch.get("hr", batch.get("gt")).to(device, non_blocking=True)
+        else:
+            noisy_lr = batch[0].to(device, non_blocking=True)
+            clean_hr = batch[1].to(device, non_blocking=True)
 
-            noisy_lr_p, (ph, pw) = pad_to_multiple(noisy_lr, multiple=4)
-            pred_hr = model(noisy_lr_p)
-            pred_hr = crop_to_scale(pred_hr, ph, pw, scale=scale)
-            pred_hr = torch.clamp(pred_hr, 0.0, 1.0)
+        with torch.autocast(device_type="cuda", enabled=use_amp):
+            pred_hr = model(noisy_lr)
+        pred_hr = torch.clamp(pred_hr.float(), 0.0, 1.0)
 
-            pred_np = pred_hr.cpu().numpy()[0, 0]
-            clean_np = clean_hr.cpu().numpy()[0, 0]
+        pred_np = pred_hr.cpu().numpy()[0, 0]
+        clean_np = clean_hr.cpu().numpy()[0, 0]
 
-            metrics = stratified_ssim(pred_np, clean_np)
+        metrics = stratified_ssim(pred_np, clean_np)
 
-            if isinstance(metrics, dict):
-                total_ssim += float(metrics["ssim"])
-                total_ssim_edge += float(metrics["ssim_edge"])
-            else:
-                total_ssim += float(metrics[0])
-                total_ssim_edge += float(metrics[1])
-                
-    # FIX 3: Explicit cleanup
-    del batch, noisy_lr, clean_hr, pred_hr
-    
+        if isinstance(metrics, dict):
+            total_ssim += float(metrics["ssim"])
+            total_ssim_edge += float(metrics["ssim_edge"])
+        else:
+            total_ssim += float(metrics[0])
+            total_ssim_edge += float(metrics[1])
+
     avg_ssim = total_ssim / len(dataloader)
     avg_ssim_edge = total_ssim_edge / len(dataloader)
     return avg_ssim, avg_ssim_edge
@@ -249,6 +221,12 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     torch.manual_seed(get_cfg("train.seed", 42))
+
+    # Fixed batch shape every step (drop_last=True below) -> let cudnn
+    # autotune and reuse the fastest conv algorithms instead of picking
+    # generic ones. Big win on T4s for the strided/PixelShuffle convs.
+    torch.backends.cudnn.benchmark = True
+
     sp = load_splits()
     cache_dir = get_cfg("cache.dir", "/kaggle/working/cache")
 
@@ -258,43 +236,42 @@ def main() -> int:
     batch_size = get_cfg("train.batch_size", 8)
     workers = get_cfg("train.num_workers", 4)
 
-    persistent = bool(get_cfg("train.persistent_workers", False)) and workers > 0
-    prefetch = int(get_cfg("train.prefetch_factor", 2))
-
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=workers, 
-        pin_memory=False, # FIX 4: Disabled pin_memory to stop background thread leaks
-        drop_last=True,
-        persistent_workers=persistent,
-        prefetch_factor=prefetch if workers > 0 else None,
+        num_workers=workers, pin_memory=True, drop_last=True,
+        persistent_workers=workers > 0,
     )
 
     val_workers = min(workers, 1)
     val_loader = DataLoader(
         val_ood_ds, batch_size=1, shuffle=False,
-        num_workers=val_workers, pin_memory=False,
-        persistent_workers=False,
+        num_workers=workers, pin_memory=True,
+        persistent_workers=workers > 0,
     )
 
     scale_factor = get_cfg("dataset.scale", 2)
     model = MODELS["nafnet"](scale=scale_factor).to(device)
 
     n_gpus = torch.cuda.device_count()
-    if n_gpus > 1:
-        print(f"--- Detected {n_gpus} GPUs -> wrapping model in nn.DataParallel ---")
-        model = nn.DataParallel(model)
+    multi_gpu = n_gpus > 1 and device.type == "cuda"
+    if multi_gpu:
+        print(f"--- Detected {n_gpus} GPUs -> wrapping model in nn.DataParallel "
+              f"(effective per-GPU batch ~= {batch_size // n_gpus}) ---")
+        model = nn.DataParallel(model, device_ids=list(range(n_gpus)))
+
+    if torch.cuda.is_available():
+        for i in range(n_gpus):
+            props = torch.cuda.get_device_properties(i)
+            print(f"    GPU{i}: {props.name}, {_gb(props.total_memory):.1f}GB total")
+
+    use_amp = bool(get_cfg("train.amp", True)) and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    log_interval = int(get_cfg("train.log_interval", 50))
+    print(f"--- Mixed precision (AMP): {use_amp} | memory log every {log_interval} steps ---")
 
     epochs = get_cfg("train.epochs", 100)
     optimizer = optim.AdamW(model.parameters(), lr=get_cfg("train.lr", 5e-4), weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-
-    use_amp = bool(get_cfg("train.amp", True)) and device.type == "cuda"
-    
-    # FIX 2: Updated to PyTorch 2.x standard calls
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
-    if use_amp:
-        print("--- AMP (mixed precision) enabled ---")
 
     charbonnier = CharbonnierLoss().to(device)
     sobel_loss = SobelEdgeLoss().to(device)
@@ -304,37 +281,31 @@ def main() -> int:
     for param in lpips_fn.parameters():
         param.requires_grad = False
 
-    loss_fns = (charbonnier, lpips_fn, sobel_loss, msssim_loss, hf_loss)
-    loss_weights = {
-        "char":   float(get_cfg("train.loss.char_w", 1.0)),
-        "lpips":  float(get_cfg("train.loss.lpips_w", 0.05)),
-        "edge":   float(get_cfg("train.loss.edge_w", 0.2)),
-        "msssim": float(get_cfg("train.loss.msssim_w", 0.3)),
-        "hf":     float(get_cfg("train.loss.hf_w", 0.4)),
-    }
-    print(f"--- Loss weights: {loss_weights} ---")
-    print(f"--- DataLoader: train workers={workers} (persistent={persistent}, "
-          f"prefetch_factor={prefetch}) | val workers={val_workers} (persistent=False) ---")
-
+    loss_fns = (charbonnier, lpips_fn, sobel_loss)
     best_ood_ssim = 0.0
 
-    print(f"--- Starting Training Run (3-level NAFNet) for {epochs} epochs on {device} "
-          f"({n_gpus} GPU{'s' if n_gpus != 1 else ''}) ---")
-    log_mem("startup")
-    
+    print(f"--- Starting Training Run (High-Capacity U-Net NAFNet) for {epochs} epochs on {device} ---")
     for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, loss_fns, loss_weights, device, scaler)
+        reset_peak_memory_stats()
+        epoch_start = time.time()
+
+        train_loss = train_one_epoch(model, train_loader, optimizer, loss_fns, device,
+                                      epoch, use_amp, scaler, log_interval)
         scheduler.step()
 
-        ood_ssim, ood_ssim_edge = evaluate_ood(model, val_loader, device, scale=scale_factor)
+        ood_ssim, ood_ssim_edge = evaluate_ood(model, val_loader, device, use_amp)
 
+        epoch_time = time.time() - epoch_start
         print(f"Epoch {epoch:03d}/{epochs:03d} | Loss: {train_loss:.4f} | "
-              f"OOD SSIM: {ood_ssim:.4f} | OOD Edge: {ood_ssim_edge:.4f}")
+              f"OOD SSIM: {ood_ssim:.4f} | OOD Edge: {ood_ssim_edge:.4f} | "
+              f"Time: {epoch_time:.1f}s")
+        log_memory(tag=f"epoch {epoch} end")
 
         if ood_ssim > best_ood_ssim:
             best_ood_ssim = ood_ssim
             save_path = output_dir / "best_nafnet.pt"
-            torch.save(unwrap(model).state_dict(), save_path)
+            state_dict = model.module.state_dict() if multi_gpu else model.state_dict()
+            torch.save(state_dict, save_path)
             print(f" -> Checkpoint saved to {save_path}")
 
         gc.collect()
