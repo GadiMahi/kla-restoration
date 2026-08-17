@@ -117,3 +117,20 @@ class RestorationDataset(Dataset):
             "hr": torch.from_numpy(np.ascontiguousarray(normalize(gt))).unsqueeze(0),
             "stem": stem,
         }
+
+
+def estimate_grad_threshold(cache_dir, percentile=40, lr_patch=64, n=2000, seed=0) -> float:
+    """Measure the crop-gradient distribution instead of guessing a threshold."""
+    ds = RestorationDataset(cache_dir, lr_patch=lr_patch, train=False, seed=seed)
+    rng = np.random.default_rng(seed)
+    vals = []
+    for _ in range(n):
+        gi, i, _ = ds.items[int(rng.integers(0, len(ds.items)))]
+        _, lr = ds._read(gi, i)
+        H, W = lr.shape
+        if H <= lr_patch or W <= lr_patch:
+            continue
+        y = int(rng.integers(0, H - lr_patch + 1))
+        x = int(rng.integers(0, W - lr_patch + 1))
+        vals.append(_grad_energy(lr[y:y + lr_patch, x:x + lr_patch]))
+    return float(np.percentile(vals, percentile)) if vals else 0.0
