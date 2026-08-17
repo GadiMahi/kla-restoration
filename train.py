@@ -1,59 +1,14 @@
 #!/usr/bin/env python3
 """
-v2 changes from the original train.py:
-  1. Multi-GPU: wraps the model in nn.DataParallel when >1 GPU is visible
-     (e.g. Kaggle T4x2). No script/CLI changes needed -- DataParallel
-     splits whatever --set train.batch_size=N you pass across the visible
-     GPUs automatically. Safe here because NAFBlock uses per-sample
-     LayerNorm2d, not BatchNorm, so there's no cross-GPU stat-sync pitfall
-     to worry about.
-  2. AMP (mixed precision) on top of that for T4 throughput. The
-     numerically sensitive losses (LPIPS, MS-SSIM, high-freq) are forced
-     back to fp32 inside the autocast region since SSIM-style losses and
-     VGG-based LPIPS are known to be unstable in fp16.
-  3. Loss function: added a differentiable MS-SSIM term (pytorch-msssim,
-     GPU-native, no numpy round-trip -- unlike skimage SSIM, which is why
-     it broke autograd before) and a high-frequency texture loss aimed
-     directly at the "painterly" over-smoothing problem. Sobel edge
-     weight was reduced since MS-SSIM already covers structure/edges to
-     some degree and stacking both at full weight over-constrains.
-  4. Checkpoints are always saved as a plain (unwrapped) state_dict, so a
-     model trained with DataParallel loads cleanly in a single-GPU
-     inference script with no key-prefix surgery needed.
-
-v3 changes (host/CPU RAM fix, not a GPU OOM):
-  Symptom was a Kaggle *system RAM* OOM (the 30GB host ceiling), not a
-  CUDA OOM, and nothing about the model changed -- so this only touches
-  DataLoader construction:
-    - val_loader no longer inherits train's worker count / pin_memory /
-      persistent_workers. It's batch_size=1 and only runs once per epoch,
-      so a second full set of long-lived worker processes for it was
-      pure waste.
-    - persistent_workers now defaults to False (override with
-      --set train.persistent_workers=true once RAM headroom is
-      confirmed). Persistent workers stay alive for the whole 100-epoch
-      run, so whatever RestorationDataset caches in __init__ gets held
-      in every worker process the entire time instead of being released
-      between epochs.
-    - prefetch_factor is explicit and configurable (train.prefetch_factor,
-      default 2) instead of relying on the PyTorch default, and is only
-      passed when num_workers > 0 (PyTorch errors otherwise).
-    - Added a per-epoch gc.collect() (+ torch.cuda.empty_cache()) and an
-      optional psutil RSS printout so you can see whether RAM is a flat
-      high-water-mark (eager caching in dataset __init__) or climbs epoch
-      over epoch (a real leak) -- these need different fixes.
-  If OOM persists after this, the next suspect is RestorationDataset
-  itself: if it loads the whole cache into a Python list/dict up front,
-  that's a single-process-level RAM cost this file can't fix from the
-  outside. Re-running with --set train.num_workers=0 isolates it: still
-  OOMs with 0 workers -> the fix has to happen in dataset.py (lazy
-  per-item disk reads / np.load(mmap_mode="r") instead of eager loading).
-
-Everything else (config loading, dataset/splits, checkpoint logic) is
-untouched from the original script -- only paste this over your existing
-train.py, no other files need to change except src/model.py.
-
-Install the one new dependency: pip install pytorch-msssim
+v4 changes (Memory Leak & Warning Fixes):
+  - Wrapped `tqdm` in `with` context managers. This forces the DataLoader 
+    generator to cleanly close at the end of the epoch, allowing PyTorch 
+    to destroy the worker IPC queues and free host RAM.
+  - Disabled `pin_memory=True` in train_loader. Pinned memory threads are 
+    notorious for leaking host RAM across epochs when workers respawn.
+  - Added explicit `del` statements at the end of train/eval loops to 
+    force variable garbage collection.
+  - Updated deprecated `torch.cuda.amp` calls to PyTorch 2.x `torch.amp` standards.
 """
 from __future__ import annotations
 import argparse
@@ -120,17 +75,12 @@ class SobelEdgeLoss(nn.Module):
 
 
 class MSSSIMLoss(nn.Module):
-    """1 - MS-SSIM. Fully differentiable, GPU-native.
-    Dynamically falls back to single-scale SSIM if the image patch 
-    is smaller than 160x160 (since MS-SSIM requires 4 downsamplings)."""
     def __init__(self, data_range=1.0):
         super().__init__()
         self.data_range = data_range
 
     def forward(self, pred, target):
-        # Check the smallest spatial dimension (Height or Width)
         min_side = min(pred.shape[-2], pred.shape[-1])
-        
         if min_side >= 160:
             return 1.0 - ms_ssim(pred, target, data_range=self.data_range, size_average=True)
         else:
@@ -138,16 +88,6 @@ class MSSSIMLoss(nn.Module):
 
 
 class HighFrequencyLoss(nn.Module):
-    """L1 loss on the high-frequency residual (image minus a Gaussian-
-    blurred version of itself). This is the direct fix for the
-    "painterly / plastic" over-smoothing: pixel losses like Charbonnier
-    are minimized on average by regressing to a smooth mean whenever the
-    exact high-frequency detail is ambiguous, which is exactly what
-    happens with texture. This loss explicitly rewards matching the
-    *amount* of local high-frequency energy, not just low-frequency
-    structure. It can't reintroduce speckle noise because the target
-    side is always the clean HR ground truth -- the network is never
-    shown a noisy high-frequency target to chase."""
     def __init__(self, kernel_size=5, sigma=1.5):
         super().__init__()
         coords = torch.arange(kernel_size).float() - kernel_size // 2
@@ -164,7 +104,7 @@ class HighFrequencyLoss(nn.Module):
         return self.l1(pred - pred_blur, target - target_blur)
 
 
-# --- Padding helpers (fully-conv model, arbitrary input size incl. 512) ---
+# --- Padding helpers ---
 
 def pad_to_multiple(x: torch.Tensor, multiple: int = 4):
     h, w = x.shape[-2:]
@@ -183,12 +123,10 @@ def crop_to_scale(x: torch.Tensor, pad_h: int, pad_w: int, scale: int):
 
 
 def unwrap(model: nn.Module) -> nn.Module:
-    """Returns the underlying module whether or not it's DataParallel-wrapped."""
     return model.module if hasattr(model, "module") else model
 
 
 def log_mem(tag: str = ""):
-    """Best-effort host RSS printout. No-op if psutil isn't installed."""
     if not _HAS_PSUTIL:
         return
     rss_gb = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
@@ -204,42 +142,45 @@ def train_one_epoch(model, dataloader, optimizer, loss_fns, loss_weights, device
     w = loss_weights
     amp_enabled = scaler.is_enabled()
 
-    pbar = tqdm(dataloader, desc="Training", leave=False)
-    for batch in pbar:
-        if isinstance(batch, dict):
-            noisy_lr = batch.get("lr", batch.get("noisy")).to(device, non_blocking=True)
-            clean_hr = batch.get("hr", batch.get("gt")).to(device, non_blocking=True)
-        else:
-            noisy_lr = batch[0].to(device, non_blocking=True)
-            clean_hr = batch[1].to(device, non_blocking=True)
+    # FIX 1: Use `with` context manager to force generator cleanup
+    with tqdm(dataloader, desc="Training", leave=False) as pbar:
+        for batch in pbar:
+            if isinstance(batch, dict):
+                noisy_lr = batch.get("lr", batch.get("noisy")).to(device, non_blocking=True)
+                clean_hr = batch.get("hr", batch.get("gt")).to(device, non_blocking=True)
+            else:
+                noisy_lr = batch[0].to(device, non_blocking=True)
+                clean_hr = batch[1].to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
 
-        with torch.cuda.amp.autocast(enabled=amp_enabled):
-            pred_hr = model(noisy_lr)
-            l_char = charbonnier(pred_hr, clean_hr)
-            l_edge = sobel_loss(pred_hr, clean_hr)
+            # FIX 2: Updated to PyTorch 2.x standard calls
+            with torch.amp.autocast('cuda', enabled=amp_enabled):
+                pred_hr = model(noisy_lr)
+                l_char = charbonnier(pred_hr, clean_hr)
+                l_edge = sobel_loss(pred_hr, clean_hr)
 
-        # Numerically sensitive losses forced to fp32 even under AMP.
-        with torch.cuda.amp.autocast(enabled=False):
-            pred_f = pred_hr.float()
-            clean_f = clean_hr.float()
-            pred_norm = pred_f * 2.0 - 1.0
-            clean_norm = clean_f * 2.0 - 1.0
-            l_perceptual = lpips_fn(pred_norm, clean_norm).mean()
-            l_msssim = msssim_loss(pred_f, clean_f)
-            l_hf = hf_loss(pred_f, clean_f)
+            with torch.amp.autocast('cuda', enabled=False):
+                pred_f = pred_hr.float()
+                clean_f = clean_hr.float()
+                pred_norm = pred_f * 2.0 - 1.0
+                clean_norm = clean_f * 2.0 - 1.0
+                l_perceptual = lpips_fn(pred_norm, clean_norm).mean()
+                l_msssim = msssim_loss(pred_f, clean_f)
+                l_hf = hf_loss(pred_f, clean_f)
 
-        loss = (w["char"] * l_char + w["lpips"] * l_perceptual + w["edge"] * l_edge
-                + w["msssim"] * l_msssim + w["hf"] * l_hf)
+            loss = (w["char"] * l_char + w["lpips"] * l_perceptual + w["edge"] * l_edge
+                    + w["msssim"] * l_msssim + w["hf"] * l_hf)
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-        total_loss += loss.item()
-        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-
+            total_loss += loss.item()
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            
+    # FIX 3: Explicitly delete batch references to free memory
+    del batch, noisy_lr, clean_hr, pred_hr, loss
     return total_loss / len(dataloader)
 
 
@@ -249,34 +190,35 @@ def evaluate_ood(model, dataloader, device, scale: int):
     total_ssim = 0.0
     total_ssim_edge = 0.0
 
-    pbar = tqdm(dataloader, desc="Validating (OOD)", leave=False)
-    for batch in pbar:
-        if isinstance(batch, dict):
-            noisy_lr = batch.get("lr", batch.get("noisy")).to(device)
-            clean_hr = batch.get("hr", batch.get("gt")).to(device)
-        else:
-            noisy_lr, clean_hr = batch[0].to(device), batch[1].to(device)
+    # FIX 1: Use `with` context manager
+    with tqdm(dataloader, desc="Validating (OOD)", leave=False) as pbar:
+        for batch in pbar:
+            if isinstance(batch, dict):
+                noisy_lr = batch.get("lr", batch.get("noisy")).to(device)
+                clean_hr = batch.get("hr", batch.get("gt")).to(device)
+            else:
+                noisy_lr, clean_hr = batch[0].to(device), batch[1].to(device)
 
-        # Pad defensively -- val_ood images should already be a fixed
-        # size, but this keeps eval robust if that ever changes (e.g.
-        # mixed-resolution OOD samples).
-        noisy_lr_p, (ph, pw) = pad_to_multiple(noisy_lr, multiple=4)
-        pred_hr = model(noisy_lr_p)
-        pred_hr = crop_to_scale(pred_hr, ph, pw, scale=scale)
-        pred_hr = torch.clamp(pred_hr, 0.0, 1.0)
+            noisy_lr_p, (ph, pw) = pad_to_multiple(noisy_lr, multiple=4)
+            pred_hr = model(noisy_lr_p)
+            pred_hr = crop_to_scale(pred_hr, ph, pw, scale=scale)
+            pred_hr = torch.clamp(pred_hr, 0.0, 1.0)
 
-        pred_np = pred_hr.cpu().numpy()[0, 0]
-        clean_np = clean_hr.cpu().numpy()[0, 0]
+            pred_np = pred_hr.cpu().numpy()[0, 0]
+            clean_np = clean_hr.cpu().numpy()[0, 0]
 
-        metrics = stratified_ssim(pred_np, clean_np)
+            metrics = stratified_ssim(pred_np, clean_np)
 
-        if isinstance(metrics, dict):
-            total_ssim += float(metrics["ssim"])
-            total_ssim_edge += float(metrics["ssim_edge"])
-        else:
-            total_ssim += float(metrics[0])
-            total_ssim_edge += float(metrics[1])
-
+            if isinstance(metrics, dict):
+                total_ssim += float(metrics["ssim"])
+                total_ssim_edge += float(metrics["ssim_edge"])
+            else:
+                total_ssim += float(metrics[0])
+                total_ssim_edge += float(metrics[1])
+                
+    # FIX 3: Explicit cleanup
+    del batch, noisy_lr, clean_hr, pred_hr
+    
     avg_ssim = total_ssim / len(dataloader)
     avg_ssim_edge = total_ssim_edge / len(dataloader)
     return avg_ssim, avg_ssim_edge
@@ -310,37 +252,24 @@ def main() -> int:
     sp = load_splits()
     cache_dir = get_cfg("cache.dir", "/kaggle/working/cache")
 
-    # Explicit synth_p rather than relying on RestorationDataset's default --
-    # unverified here since src/dataset.py wasn't available when this script
-    # was written. If your default already matches, this is a no-op; if it
-    # doesn't, this is the difference between the synthetic-augmentation risk
-    # mitigation actually running or silently not running.
-    
     train_ds = RestorationDataset(cache_dir, stems=sp["train"])
     val_ood_ds = RestorationDataset(cache_dir, stems=sp["val_ood"], train=False)
 
     batch_size = get_cfg("train.batch_size", 8)
     workers = get_cfg("train.num_workers", 4)
 
-    # --- Host-RAM-conscious DataLoader settings ---
-    # persistent_workers defaults to False: with it True, every worker
-    # process stays alive (and holding whatever it cached) for all
-    # `epochs` runs instead of being torn down and its memory released
-    # between epochs. Flip back on with --set train.persistent_workers=true
-    # once you've confirmed there's RAM headroom.
     persistent = bool(get_cfg("train.persistent_workers", False)) and workers > 0
     prefetch = int(get_cfg("train.prefetch_factor", 2))
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=workers, pin_memory=True, drop_last=True,
+        num_workers=workers, 
+        pin_memory=False, # FIX 4: Disabled pin_memory to stop background thread leaks
+        drop_last=True,
         persistent_workers=persistent,
         prefetch_factor=prefetch if workers > 0 else None,
     )
-    # val is batch_size=1 and only runs once per epoch -- it doesn't need
-    # its own full set of long-lived workers, pinned memory, or the same
-    # worker count as train. Previously this quietly doubled the number
-    # of live worker processes holding a copy of the dataset cache.
+
     val_workers = min(workers, 1)
     val_loader = DataLoader(
         val_ood_ds, batch_size=1, shuffle=False,
@@ -361,7 +290,9 @@ def main() -> int:
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     use_amp = bool(get_cfg("train.amp", True)) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    
+    # FIX 2: Updated to PyTorch 2.x standard calls
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     if use_amp:
         print("--- AMP (mixed precision) enabled ---")
 
@@ -390,6 +321,7 @@ def main() -> int:
     print(f"--- Starting Training Run (3-level NAFNet) for {epochs} epochs on {device} "
           f"({n_gpus} GPU{'s' if n_gpus != 1 else ''}) ---")
     log_mem("startup")
+    
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, loss_fns, loss_weights, device, scaler)
         scheduler.step()
@@ -402,24 +334,15 @@ def main() -> int:
         if ood_ssim > best_ood_ssim:
             best_ood_ssim = ood_ssim
             save_path = output_dir / "best_nafnet.pt"
-            # Always save the unwrapped state_dict so a DataParallel-trained
-            # checkpoint loads directly into a plain single-GPU model at
-            # inference time -- no "module." key surgery needed.
             torch.save(unwrap(model).state_dict(), save_path)
             print(f" -> Checkpoint saved to {save_path}")
 
-        # Release any epoch-scoped Python objects / cached CUDA blocks
-        # before the next epoch starts. Cheap insurance against reference
-        # cycles; won't fix a per-worker dataset-caching problem, but
-        # combined with persistent_workers=False it lets each epoch's
-        # non-persistent val workers actually free their memory.
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
         log_mem(f"after epoch {epoch:03d}")
 
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
