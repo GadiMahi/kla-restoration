@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Standalone evaluation script — KLA AI Hackathon submission.
+Team: OOM Survivors
 
 Usage:
     python run.py <input_dir> <output_dir>
@@ -27,13 +28,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# Make the local `models` package importable regardless of CWD.
+# Make the local `src` package importable regardless of CWD.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.model import build_model  # noqa: E402
 
 SCALE = 2           # fixed by the trained checkpoint (512<->256 or 256<->128 SR factor)
 PAD_MULTIPLE = 2    # NAFNet_UNet has one stride-2 down/up level -> pad H,W to a multiple of 2
-WEIGHTS_PATH = Path(__file__).resolve().parent / "models" / "best_nafnet.pt"
+
+# Look for weights in models/ (for final submission) with a fallback to artifacts/ (for local Kaggle testing)
+BASE_DIR = Path(__file__).resolve().parent
+WEIGHTS_PATH = BASE_DIR / "models" / "best_nafnet.pt"
+FALLBACK_WEIGHTS = BASE_DIR / "artifacts" / "best_nafnet.pt"
 
 
 def pad_to_multiple(x: torch.Tensor, m: int):
@@ -86,13 +91,18 @@ def main() -> int:
 
     model = build_model("nafnet", scale=SCALE).to(device).eval()
 
-    if WEIGHTS_PATH.exists():
-        sd = torch.load(WEIGHTS_PATH, map_location=device)
+    # Determine which weights file to use
+    active_weights_path = WEIGHTS_PATH
+    if not active_weights_path.exists() and FALLBACK_WEIGHTS.exists():
+        active_weights_path = FALLBACK_WEIGHTS
+
+    if active_weights_path.exists():
+        sd = torch.load(active_weights_path, map_location=device)
         state_dict = sd["model"] if isinstance(sd, dict) and "model" in sd and hasattr(sd["model"], "keys") else sd
         model.load_state_dict(state_dict)
-        print(f"Loaded weights from: {WEIGHTS_PATH}")
+        print(f"Loaded weights from: {active_weights_path}")
     else:
-        print(f"WARNING: weights file not found at {WEIGHTS_PATH}. Running with UNINITIALIZED weights!")
+        print(f"WARNING: weights file not found at {WEIGHTS_PATH} or {FALLBACK_WEIGHTS}. Running with UNINITIALIZED weights!")
 
     # Load everything up front and group by shape so batches stay rectangular.
     t_start = time.perf_counter()
