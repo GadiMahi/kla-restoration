@@ -7,18 +7,6 @@ The network is fully convolutional, so full-size inference is unaffected.
 Crops are drawn with gradient-based rejection sampling: wafer imagery is mostly
 flat die area and uniform random crops would spend most of training on blank
 regions.
-
---- Host-RAM fix (Kaggle T4x2) ---
-__init__ used to mmap *every* group in index.json regardless of `stems`, so
-e.g. train_ds also held open mmap handles to the val/OOD files (and vice
-versa) that it would never read. With both loaders using
-persistent_workers=True across a 100-epoch run, the unnecessary extra
-touchable file surface let the OS page cache (counted as RSS in a
-memory-cgroup-limited container like a Kaggle session) grow steadily until
-the process got OOM-killed -- visible in the training logs as host_peak_rss
-climbing ~1GB/epoch with no plateau, while GPU memory stayed flat. Now each
-RestorationDataset instance only mmaps the groups its own `stems` filter
-actually needs.
 """
 from __future__ import annotations
 
@@ -50,12 +38,7 @@ class RestorationDataset(Dataset):
 
         self._groups, self.items = [], []
         keep = set(stems) if stems is not None else None
-        for g in self.index:
-            # Skip groups this split will never read -- avoids mmapping (and
-            # eventually paging into RSS) file content that isn't ours.
-            if keep is not None and not any(stem in keep for stem in g["stems"]):
-                continue
-            gi = len(self._groups)
+        for gi, g in enumerate(self.index):
             self._groups.append((
                 np.load(self.cache_dir / g["gt_file"], mmap_mode="r"),
                 np.load(self.cache_dir / g["lr_file"], mmap_mode="r"),

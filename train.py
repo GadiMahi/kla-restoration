@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 import argparse
-import gc
+import sys
+import os
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from src.config import add_config_args, load_config
-from src.splits import load_splits
 from src.dataset import RestorationDataset
+from src.splits import load_splits
 from src.model import MODELS
 from src.eval_utils import stratified_ssim
+import lpips 
 
-# --- NATIVE LOSSES ---
+# --- PyTorch Native Losses ---
 
 class CharbonnierLoss(nn.Module):
     def __init__(self, eps=1e-3):
@@ -40,135 +46,151 @@ class SobelEdgeLoss(nn.Module):
         target_y = F.conv2d(target, self.weight_y, padding=1)
         return self.l1(pred_x, target_x) + self.l1(pred_y, target_y)
 
-class HighFrequencyLoss(nn.Module):
-    def __init__(self, kernel_size=5, sigma=1.5):
-        super().__init__()
-        coords = torch.arange(kernel_size).float() - kernel_size // 2
-        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
-        g = g / g.sum()
-        kernel = (g[:, None] * g[None, :]).view(1, 1, kernel_size, kernel_size)
-        self.register_buffer('kernel', kernel)
-        self.pad = kernel_size // 2
-        self.l1 = nn.L1Loss()
+# --- Core Loop ---
 
-    def forward(self, pred, target):
-        pred_blur = F.conv2d(pred, self.kernel, padding=self.pad)
-        target_blur = F.conv2d(target, self.kernel, padding=self.pad)
-        return self.l1(pred - pred_blur, target - target_blur)
+def train_one_epoch(model, dataloader, optimizer, loss_fns, device):
+    model.train()
+    total_loss = 0.0
+    charbonnier, lpips_fn, sobel_loss = loss_fns
+    
+    pbar = tqdm(dataloader, desc="Training", leave=False)
+    for batch in pbar:
+        if isinstance(batch, dict):
+            noisy_lr = batch.get("lr", batch.get("noisy")).to(device)
+            clean_hr = batch.get("hr", batch.get("gt")).to(device)
+        else:
+            noisy_lr, clean_hr = batch[0].to(device), batch[1].to(device)
+        
+        optimizer.zero_grad()
+        pred_hr = model(noisy_lr)
+        
+        # 1. Pixel Fidelity Loss (Primary driver for contrast and exact intensities)
+        l_char = charbonnier(pred_hr, clean_hr)
+        
+        # 2. Perceptual Loss (Scaled down to 0.05 so it doesn't destroy pixel contrast)
+        pred_norm = pred_hr * 2.0 - 1.0
+        clean_norm = clean_hr * 2.0 - 1.0
+        l_perceptual = lpips_fn(pred_norm, clean_norm).mean()
+        
+        # 3. Structural Edge Loss
+        l_edge = sobel_loss(pred_hr, clean_hr)
+        
+        # Balanced Loss Combination
+        loss = (1.0 * l_char) + (0.05 * l_perceptual) + (0.5 * l_edge)
+        
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        
+    return total_loss / len(dataloader)
+
+
+@torch.no_grad()
+def evaluate_ood(model, dataloader, device):
+    model.eval()
+    total_ssim = 0.0
+    total_ssim_edge = 0.0
+    
+    pbar = tqdm(dataloader, desc="Validating (OOD)", leave=False)
+    for batch in pbar:
+        if isinstance(batch, dict):
+            noisy_lr = batch.get("lr", batch.get("noisy")).to(device)
+            clean_hr = batch.get("hr", batch.get("gt")).to(device)
+        else:
+            noisy_lr, clean_hr = batch[0].to(device), batch[1].to(device)
+            
+        pred_hr = model(noisy_lr)
+        pred_hr = torch.clamp(pred_hr, 0.0, 1.0)
+        
+        pred_np = pred_hr.cpu().numpy()[0, 0]
+        clean_np = clean_hr.cpu().numpy()[0, 0]
+        
+        metrics = stratified_ssim(pred_np, clean_np)
+        
+        if isinstance(metrics, dict):
+            total_ssim += float(metrics["ssim"])
+            total_ssim_edge += float(metrics["ssim_edge"])
+        else:
+            total_ssim += float(metrics[0])
+            total_ssim_edge += float(metrics[1])
+        
+    avg_ssim = total_ssim / len(dataloader)
+    avg_ssim_edge = total_ssim_edge / len(dataloader)
+    return avg_ssim, avg_ssim_edge
 
 
 def main() -> int:
-    ap = add_config_args(argparse.ArgumentParser())
+    ap = add_config_args(argparse.ArgumentParser(description=__doc__))
     args = ap.parse_args()
     cfg = load_config(args.config, args.overrides)
 
-    def get_cfg(key, default=None):
-        if hasattr(cfg, "get_path"):
-            try: return cfg.get_path(key)
-            except: pass
-        if hasattr(cfg, "get"): return cfg.get(key)
-        return default
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    def get_cfg(key, default=None):
+        if hasattr(cfg, "get_path"):
+            try:
+                val = cfg.get_path(key)
+                if val is not None: return val
+            except Exception: pass
+        if hasattr(cfg, "get"):
+            val = cfg.get(key)
+            if val is not None: return val
+        return default
+
     output_dir = Path(get_cfg("output.dir", "/kaggle/working/kla-restoration/artifacts"))
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    torch.manual_seed(get_cfg("train.seed", 42))
+    sp = load_splits()
     cache_dir = get_cfg("cache.dir", "/kaggle/working/cache")
     
-    batch_size = 128
-    epochs = get_cfg("train.epochs", 100)
-
-    print("--- Starting Minimal Training Script (Isolating Native Losses) ---")
-    print(f"Device: {device} | Batch Size: {batch_size} | Epochs: {epochs}")
-
-    torch.manual_seed(42)
-    sp = load_splits()
-
-    train_ds = RestorationDataset(cache_dir, stems=sp["train"], train=True)
-    val_ds = RestorationDataset(cache_dir, stems=sp["val_ood"], train=False)
-
-    # STRICT ANTI-LEAK SETTINGS: 0 workers, no pin_memory, no persistent_workers
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, 
-                              num_workers=0, pin_memory=False)
+    train_ds = RestorationDataset(cache_dir, stems=sp["train"])
+    val_ood_ds = RestorationDataset(cache_dir, stems=sp["val_ood"], train=False)
     
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, 
-                            num_workers=0, pin_memory=False)
+    batch_size = get_cfg("train.batch_size", 8)
+    workers = get_cfg("train.num_workers", 4)
+    
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, 
+        num_workers=workers, pin_memory=True, drop_last=True
+    )
+    val_loader = DataLoader(
+        val_ood_ds, batch_size=1, shuffle=False, 
+        num_workers=workers, pin_memory=True
+    )
 
     scale_factor = get_cfg("dataset.scale", 2)
     model = MODELS["nafnet"](scale=scale_factor).to(device)
-
-    if torch.cuda.device_count() > 1:
-        print(f"Wrapping model in nn.DataParallel across {torch.cuda.device_count()} GPUs")
-        model = nn.DataParallel(model)
-
-    optimizer = optim.AdamW(model.parameters(), lr=2e-4)
-
+    
+    epochs = get_cfg("train.epochs", 100)
+    optimizer = optim.AdamW(model.parameters(), lr=get_cfg("train.lr", 5e-4), weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    
     charbonnier = CharbonnierLoss().to(device)
     sobel_loss = SobelEdgeLoss().to(device)
-    hf_loss = HighFrequencyLoss().to(device)
-
-    w_char, w_edge, w_hf = 1.0, 0.5, 0.5
-    best_ssim = 0.0
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        epoch_loss = 0.0
-
-        for batch in train_loader:
-            lr = batch["lr"].to(device)
-            hr = batch["hr"].to(device)
-
-            optimizer.zero_grad()
-            pred = model(lr)
-            
-            l_char = charbonnier(pred, hr)
-            l_edge = sobel_loss(pred, hr)
-            l_hf = hf_loss(pred, hr)
-            
-            loss = (w_char * l_char) + (w_edge * l_edge) + (w_hf * l_hf)
-            loss.backward()
-            optimizer.step()
-
-            # SINGLE sync per batch
-            epoch_loss += loss.item()
-
-        avg_train_loss = epoch_loss / len(train_loader)
-
-        # --- Evaluation Phase ---
-        model.eval()
-        epoch_ssim = 0.0
+    lpips_fn = lpips.LPIPS(net='vgg').to(device)
+    for param in lpips_fn.parameters():
+        param.requires_grad = False
         
-        with torch.no_grad():
-            for batch in val_loader:
-                lr = batch["lr"].to(device)
-                hr = batch["hr"].to(device)
-                
-                pred = torch.clamp(model(lr), 0.0, 1.0)
-                
-                pred_np = pred.cpu().numpy()[0, 0]
-                hr_np = hr.cpu().numpy()[0, 0]
-                
-                metrics = stratified_ssim(pred_np, hr_np)
-                if isinstance(metrics, dict):
-                    epoch_ssim += float(metrics["ssim"])
-                else:
-                    epoch_ssim += float(metrics[0])
-
-        avg_val_ssim = epoch_ssim / len(val_loader)
-        print(f"Epoch [{epoch:03d}/{epochs:03d}] | Train Loss: {avg_train_loss:.4f} | Val SSIM: {avg_val_ssim:.4f}")
-
-        if avg_val_ssim > best_ssim:
-            best_ssim = avg_val_ssim
+    loss_fns = (charbonnier, lpips_fn, sobel_loss)
+    best_ood_ssim = 0.0
+    
+    print(f"--- Starting Training Run (High-Capacity U-Net NAFNet) for {epochs} epochs on {device} ---")
+    for epoch in range(1, epochs + 1):
+        train_loss = train_one_epoch(model, train_loader, optimizer, loss_fns, device)
+        scheduler.step()
+        
+        ood_ssim, ood_ssim_edge = evaluate_ood(model, val_loader, device)
+        
+        print(f"Epoch {epoch:03d}/{epochs:03d} | Loss: {train_loss:.4f} | "
+              f"OOD SSIM: {ood_ssim:.4f} | OOD Edge: {ood_ssim_edge:.4f}")
+        
+        if ood_ssim > best_ood_ssim:
+            best_ood_ssim = ood_ssim
             save_path = output_dir / "best_nafnet.pt"
-            unwrapped_model = model.module if hasattr(model, "module") else model
-            torch.save(unwrapped_model.state_dict(), save_path)
+            torch.save(model.state_dict(), save_path)
             print(f" -> Checkpoint saved to {save_path}")
-
-        # --- Brutal Memory Cleanup ---
-        del batch, lr, hr, pred, loss, l_char, l_edge, l_hf
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
     return 0
 
