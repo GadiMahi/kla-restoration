@@ -35,9 +35,9 @@ from src.model import build_model  # noqa: E402
 SCALE = 2           # fixed by the trained checkpoint (512<->256 or 256<->128 SR factor)
 PAD_MULTIPLE = 2    # NAFNet_UNet has one stride-2 down/up level -> pad H,W to a multiple of 2
 
-# Look for weights in models/ (for final submission) with a fallback to artifacts/ (for local Kaggle testing)
+# Look for weights in weights/ (for final submission) with a fallback to artifacts/ (for local Kaggle testing)
 BASE_DIR = Path(__file__).resolve().parent
-WEIGHTS_PATH = BASE_DIR / "models" / "best_nafnet.pt"
+WEIGHTS_PATH = BASE_DIR / "weights" / "best_nafnet.pt"
 FALLBACK_WEIGHTS = BASE_DIR / "artifacts" / "best_nafnet.pt"
 
 
