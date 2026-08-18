@@ -12,8 +12,8 @@ interfaces described below without changing anything here.
 ## Quick start (Kaggle)
 
 ```python
-!git clone https://github.com/<org>/kla-restoration.git
-%cd kla-restoration
+!git clone https://github.com/GadiMahi/oomsurvivors.git
+%cd oomsurvivors
 !pip install -q -r requirements.txt
 
 DATA = "/kaggle/input/<dataset-slug>"
