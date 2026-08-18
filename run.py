@@ -29,7 +29,7 @@ import torch.nn.functional as F
 
 # Make the local `models` package importable regardless of CWD.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from models.model import build_model  # noqa: E402
+from src.model import build_model  # noqa: E402
 
 SCALE = 2           # fixed by the trained checkpoint (512<->256 or 256<->128 SR factor)
 PAD_MULTIPLE = 2    # NAFNet_UNet has one stride-2 down/up level -> pad H,W to a multiple of 2
